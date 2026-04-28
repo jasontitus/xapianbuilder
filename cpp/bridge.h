@@ -1,0 +1,68 @@
+// xapianbuilder C ABI exposed to Rust.
+//
+// The whole GPL-derived pipeline (HTML parsing borrowed from omega via
+// libzim, accent removal via ICU, term emission via xapian-core) lives
+// behind this boundary.
+
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct XbBuilder XbBuilder;
+typedef struct XbParsedDoc XbParsedDoc;
+
+// Mode: 0 = title DB, 1 = fulltext DB.
+XbBuilder* xb_builder_new(const char* tmp_path,
+                          const char* final_path,
+                          const char* language_iso6393,
+                          const char* stopwords_text,
+                          int mode);
+void xb_builder_free(XbBuilder*);
+
+// All add_* and finalize return 0 on success, nonzero on error
+// (call xb_last_error() for a message).
+
+int xb_add_title(XbBuilder*,
+                 const char* path,
+                 const char* title,
+                 const char* target_path /* "" if not redirect */);
+
+// content/keywords are expected pre-processed (lowercased + accents
+// stripped) by the caller (parse_html does this for HTML inputs).
+int xb_add_fulltext(XbBuilder*,
+                    const char* path,
+                    const char* title,
+                    const char* content,
+                    size_t content_len,
+                    const char* keywords,
+                    uint32_t word_count,
+                    int has_geo,
+                    double latitude,
+                    double longitude);
+
+int xb_finalize(XbBuilder*);
+
+// Run libzim's MyHtmlParser on a UTF-8 HTML buffer. Returns NULL if
+// the HTML couldn't be parsed at all. content/keywords are returned
+// already lowercased + accent-stripped (matching libzim's pipeline).
+XbParsedDoc* xb_parse_html(const char* html, size_t len);
+const char* xb_pd_content(const XbParsedDoc*, size_t* out_len);
+const char* xb_pd_keywords(const XbParsedDoc*);
+uint32_t xb_pd_word_count(const XbParsedDoc*);
+int xb_pd_indexing_allowed(const XbParsedDoc*);
+int xb_pd_has_geo(const XbParsedDoc*);
+double xb_pd_latitude(const XbParsedDoc*);
+double xb_pd_longitude(const XbParsedDoc*);
+void xb_pd_free(XbParsedDoc*);
+
+// Last error from this thread.
+const char* xb_last_error(void);
+
+#ifdef __cplusplus
+}
+#endif

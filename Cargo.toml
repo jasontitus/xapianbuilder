@@ -1,0 +1,30 @@
+[package]
+name = "xapianbuilder"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Builds Xapian fulltext and title indexes byte-compatible with kiwix/libzim ZIM archives."
+repository = "https://github.com/jasontitus/xapianbuilder"
+readme = "README.md"
+
+[[bin]]
+name = "xapianbuilder"
+path = "src/main.rs"
+test = false
+
+[lib]
+name = "xapianbuilder"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
