@@ -82,12 +82,33 @@ Commands:
   version    Print the binary version
 
 Common options:
-  --input <FILE>     JSONL stream of documents (one per line). "-" for stdin.
-  --output <FILE>    Path to write the single-file glass DB. xapianbuilder
-                     refuses to overwrite an existing file.
-  --language <ISO-639-3>   "eng", "fra", "deu", … Selects stemmer and
-                     stopword list. Empty/unknown -> no stemming.
-  --quiet            Suppress progress output to stderr.
+  --input <FILE>            JSONL stream (one doc per line). "-" for stdin.
+  --output <FILE>           Path for the single-file glass DB. Refuses
+                            to overwrite an existing file.
+  --language <CODE>         Forwarded to ICU for stemmer selection and
+                            used as the stopwords filename. libzim's
+                            convention is ISO-639-3 ("eng"); pass the
+                            2-letter code ("en") to load the vendored
+                            stopword list, since libzim ships those by
+                            short code. Empty disables stemming.
+  --stemmer <NAME>          Override the auto-derived stemmer string.
+                            "english" / "en" = Porter2 (current libzim,
+                            default), "porter" = Porter1 (older kiwix
+                            ZIMs), "none" = disable, "" = derive from
+                            --language.
+  --stopwords-file <PATH>   Explicit stopword list (overrides defaults).
+  --resolve-stopwords       Translate ISO-639-3 → ISO-639-1 to find a
+                            vendored list ("eng" → load `en`). Off by
+                            default to match libzim's exact-filename
+                            lookup behaviour.
+  --skip-if-empty           Don't write the output file if zero docs
+                            were indexed (matches libzim).
+  --jobs <N>                Worker thread count (0 = num_cpus, 1 =
+                            single-threaded). HTML parsing runs in
+                            parallel; database writes are serialised
+                            in input order so doc IDs stay stable
+                            regardless of --jobs.
+  --quiet                   Suppress progress output.
 ```
 
 Exit codes: 0 on success, nonzero on any error (message on stderr).
@@ -299,19 +320,41 @@ The boundary rules for contributors:
 
 ---
 
+## Verification
+
+Building from a 100-article fixture extracted from kiwix's
+`wikipedia_en_100_maxi_2024-01.zim` and diffing against the canonical
+Xapian DB inside that ZIM:
+
+| Comparison              | Result      |
+| ----------------------- | ----------- |
+| Document count          | 100 / 100 ✓ |
+| Magic + format          | identical   |
+| Avg doc length          | 18038 vs 18046 (0.04% diff) |
+| Per-doc term overlap    | **99.87%** (canonical-side) |
+| Per-doc unique-term diff | 431 of ~360k tokens |
+
+The remaining diff is **stemmer-version drift**: the 2024-01 sample
+was built with a stemmer that aggressively stems some words that
+modern Porter2 leaves alone (`internal → intern`, `university → univers`,
+`emergency → emerg`) but leaves common words like `they/this/was` /
+`-ist` nouns alone. No single Xapian stemmer reproduces that pattern
+exactly — looks like a custom or pre-1.4-Snowball variant. xapianbuilder
+defaults to Porter2 (matches current libzim); pass `--stemmer porter`
+for the closest old-ZIM match.
+
+Modern kiwix.org ZIMs should match xapianbuilder's default output
+much more closely; verifying against a 2025-vintage ZIM is the next
+on-deck item.
+
 ## Known limitations / next steps
 
-- **Single-threaded.** libzim parallelizes per-doc indexing via a
-  worker pool behind `s_dbaccessLock`. The C++ side already holds the
-  matching mutex; we just need the Rust feeder to spread work across
-  threads. No `--jobs` flag yet.
-- **No empty-DB suppression.** libzim skips emitting
-  `X/fulltext/xapian` if zero docs had indexable content; we always
-  produce a file. Either we add `--skip-if-empty` or the caller
-  checks doc count.
 - **End-to-end CJK/RTL coverage untested.** `FLAG_CJK_NGRAM` is set
   and ICU handles every script in accent removal, but no fixture run
   yet against Chinese / Arabic / Japanese ZIMs.
 - **Per-doc language override unused.** The JSONL `language` field is
   parsed but ignored — CLI `--language` wins. Wire this through if we
   start seeing mixed-language ZIMs (`zh-Hant` + `en` etc.).
+- **No verification against a 2025-vintage ZIM yet.** Target: pull a
+  fresh `wikipedia_en_*` from kiwix.org/library and re-run the term
+  diff. Expecting >99.99% overlap.

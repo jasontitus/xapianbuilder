@@ -1,9 +1,18 @@
 //! Stopword lists vendored from libzim's `static/stopwords/<lang>`.
 //!
-//! Lookup keys are the *short* ISO-639-1 codes that ICU produces from
-//! ISO-639-3 input (e.g. "eng" -> "en"). Returns an empty string when
-//! we don't ship a list for that language — matches libzim's "no
-//! stopwords for this language" path.
+//! libzim's indexer looks up stopwords by exact filename match against
+//! whatever language string the caller passed in. The shipped files
+//! are 2-letter codes (`en`, `fr`, …), but kiwix tooling routinely
+//! passes ISO-639-3 codes (`eng`, `fra`, …), and libzim swallows the
+//! "file not found" exception silently and indexes with no stopper.
+//! That's why production kiwix ZIMs typically contain stopword tokens
+//! like "a", "and", "the" in their fulltext indexes.
+//!
+//! `for_language` mirrors that behaviour: exact filename lookup, empty
+//! string on miss. Callers that want stopword filtering should pass the
+//! 2-letter code (`en`) or use `--stopwords-file` to point at an
+//! explicit list. `resolve_iso6393` is available for callers that want
+//! the convenience-translation path.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -36,26 +45,30 @@ fn table() -> &'static HashMap<&'static str, &'static str> {
     })
 }
 
-/// Looks up by ISO-639-1 short code (the form ICU's `Locale` returns).
-pub fn for_short_code(code: &str) -> &'static str {
+/// Exact filename lookup, mirroring libzim's `getResource("stopwords/" + lang)`.
+/// Returns an empty string for any code that doesn't have a vendored file —
+/// e.g. `for_language("eng")` is empty, `for_language("en")` is the
+/// English stopwords. This is the libzim-compat default.
+pub fn for_language(code: &str) -> &'static str {
     table().get(code).copied().unwrap_or("")
 }
 
-/// Looks up by ISO-639-3 long code (caller-facing language identifier
-/// in the JSONL input). Maps a small known set explicitly; for the
-/// rest we just take the first two characters as a best-effort match,
-/// which is enough for ISO-639-3 codes whose 1-letter equivalent is
-/// the prefix.
-pub fn for_iso6393(code: &str) -> &'static str {
+/// Convenience translation: ISO-639-3 → ISO-639-1 → vendored list.
+/// Callers can opt into this when they want the "do what I mean"
+/// behaviour rather than libzim-bug-compat. Returns "" if neither the
+/// input nor its translation has a vendored list.
+pub fn resolve_iso6393(code: &str) -> &'static str {
     if code.is_empty() {
         return "";
     }
-    if let Some(short) = iso6393_to_short(code) {
-        return for_short_code(short);
+    if let Some(direct) = table().get(code) {
+        return direct;
     }
-    // Best effort: try the first two characters lowercased.
+    if let Some(short) = iso6393_to_short(code) {
+        return for_language(short);
+    }
     let lower: String = code.chars().take(2).flat_map(char::to_lowercase).collect();
-    for_short_code(&lower)
+    for_language(&lower)
 }
 
 fn iso6393_to_short(code: &str) -> Option<&'static str> {

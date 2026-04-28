@@ -17,12 +17,22 @@ typedef struct XbBuilder XbBuilder;
 typedef struct XbParsedDoc XbParsedDoc;
 
 // Mode: 0 = title DB, 1 = fulltext DB.
+//
+// `stemmer_override` is forwarded straight to `Xapian::Stem` if
+// non-empty, bypassing the ICU-derived language code. Pass "porter"
+// for old-style stemming (matches pre-2024 kiwix ZIMs); "" to use
+// the ICU mapping; "none" or any unknown value leaves stemming off.
 XbBuilder* xb_builder_new(const char* tmp_path,
                           const char* final_path,
                           const char* language_iso6393,
                           const char* stopwords_text,
+                          const char* stemmer_override,
                           int mode);
 void xb_builder_free(XbBuilder*);
+
+// Returns 1 if no docs have been added yet (mirrors libzim's `empty`
+// flag — used by callers to suppress emitting an empty index file).
+int xb_builder_is_empty(const XbBuilder*);
 
 // All add_* and finalize return 0 on success, nonzero on error
 // (call xb_last_error() for a message).

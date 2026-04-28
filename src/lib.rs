@@ -4,7 +4,7 @@
 //! `cpp/bridge.cc`; this file is the thin RAII layer over it.
 
 use std::ffi::{CStr, CString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -29,25 +29,43 @@ impl Mode {
 
 pub struct Builder {
     raw: *mut ffi::XbBuilder,
+    tmp_path: PathBuf,
     finalized: bool,
 }
+
+// SAFETY: every method that touches `raw` either takes `&mut self` or
+// goes through a function the C++ side guards with its own mutex
+// (xb_add_*). The C ABI is therefore safe to use from multiple threads
+// holding shared references to the same builder; that's how the
+// parallel feeder in main.rs uses it.
+unsafe impl Send for Builder {}
+unsafe impl Sync for Builder {}
 
 impl Builder {
     /// `tmp_path` is the workspace where the WritableDatabase is written
     /// before compaction; `final_path` is where the single-file glass
     /// blob ends up. They must be different paths (libzim convention is
-    /// `<final>.tmp`).
+    /// `<final>.tmp`). The temp path is removed on Drop regardless of
+    /// whether `finalize()` succeeded, so callers don't have to clean
+    /// up on error.
+    ///
+    /// `stemmer_override` is forwarded straight to `Xapian::Stem` if
+    /// non-empty: pass `"porter"` for old-style stemming (matches
+    /// pre-2024 kiwix ZIMs), `""` to derive the stemmer from
+    /// `language_iso6393` via ICU, `"none"` to disable stemming.
     pub fn new(
         tmp_path: &Path,
         final_path: &Path,
         language_iso6393: &str,
         stopwords_text: &str,
+        stemmer_override: &str,
         mode: Mode,
     ) -> Result<Self> {
         let tmp = path_to_cstring(tmp_path)?;
         let fin = path_to_cstring(final_path)?;
         let lang = CString::new(language_iso6393)?;
         let sw = CString::new(stopwords_text)?;
+        let stemmer = CString::new(stemmer_override)?;
 
         let raw = unsafe {
             ffi::xb_builder_new(
@@ -55,6 +73,7 @@ impl Builder {
                 fin.as_ptr(),
                 lang.as_ptr(),
                 sw.as_ptr(),
+                stemmer.as_ptr(),
                 mode.as_int(),
             )
         };
@@ -63,11 +82,19 @@ impl Builder {
         }
         Ok(Builder {
             raw,
+            tmp_path: tmp_path.to_path_buf(),
             finalized: false,
         })
     }
 
-    pub fn add_title(&mut self, path: &str, title: &str, target_path: &str) -> Result<()> {
+    pub fn is_empty(&self) -> bool {
+        unsafe { ffi::xb_builder_is_empty(self.raw) != 0 }
+    }
+
+    /// Adds a title-DB document. Safe to call concurrently from
+    /// multiple threads — the C++ side serialises actual database
+    /// writes via an internal mutex.
+    pub fn add_title(&self, path: &str, title: &str, target_path: &str) -> Result<()> {
         let path_c = CString::new(path)?;
         let title_c = CString::new(title)?;
         let target_c = CString::new(target_path)?;
@@ -80,8 +107,9 @@ impl Builder {
         Ok(())
     }
 
+    /// Adds a fulltext-DB document. Concurrent-safe like `add_title`.
     pub fn add_fulltext(
-        &mut self,
+        &self,
         path: &str,
         title: &str,
         content: &str,
@@ -138,6 +166,12 @@ impl Drop for Builder {
         if !self.raw.is_null() {
             unsafe { ffi::xb_builder_free(self.raw) };
             self.raw = std::ptr::null_mut();
+        }
+        // Always clean up the temp directory; libzim does the same in
+        // its indexer destructor. Errors here are best-effort — the
+        // caller may already be unwinding from a different failure.
+        if self.tmp_path.exists() {
+            let _ = std::fs::remove_dir_all(&self.tmp_path);
         }
     }
 }

@@ -18,10 +18,13 @@ unsafe extern "C" {
         final_path: *const c_char,
         language_iso6393: *const c_char,
         stopwords_text: *const c_char,
+        stemmer_override: *const c_char,
         mode: c_int,
     ) -> *mut XbBuilder;
 
     pub fn xb_builder_free(b: *mut XbBuilder);
+
+    pub fn xb_builder_is_empty(b: *const XbBuilder) -> c_int;
 
     pub fn xb_add_title(
         b: *mut XbBuilder,

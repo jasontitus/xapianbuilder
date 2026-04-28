@@ -118,7 +118,7 @@ struct XbBuilder {
     std::string tmp_path;
     std::string final_path;
     std::string language;          // ISO-639-3 (stored in metadata)
-    std::string stemmer_language;  // ISO-639-1 derived from ICU
+    std::string stemmer_language;  // resolved stemmer string ("" = none)
     Xapian::SimpleStopper stopper; // populated from stopwords text
     int mode;                      // 0=title, 1=fulltext
     bool empty = true;
@@ -129,6 +129,7 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
                                      const char* final_path,
                                      const char* language_iso6393,
                                      const char* stopwords_text,
+                                     const char* stemmer_override,
                                      int mode) {
     try {
         ucnv_setDefaultName("UTF-8");
@@ -136,7 +137,14 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
         b->tmp_path = tmp_path;
         b->final_path = final_path;
         b->language = language_iso6393 ? language_iso6393 : "";
-        b->stemmer_language = stemmer_lang_for(b->language);
+        const std::string ovr = stemmer_override ? stemmer_override : "";
+        if (ovr == "none") {
+            b->stemmer_language = "";
+        } else if (!ovr.empty()) {
+            b->stemmer_language = ovr;
+        } else {
+            b->stemmer_language = stemmer_lang_for(b->language);
+        }
         b->mode = mode;
 
         // Populate stopper from newline-separated stopwords text.
@@ -180,6 +188,10 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
 }
 
 extern "C" void xb_builder_free(XbBuilder* b) { delete b; }
+
+extern "C" int xb_builder_is_empty(const XbBuilder* b) {
+    return (b && !b->empty) ? 0 : 1;
+}
 
 extern "C" int xb_add_title(XbBuilder* b,
                             const char* path,
