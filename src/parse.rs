@@ -1,16 +1,27 @@
 //! Safe wrapper over `xb_parse_html`.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 use crate::ffi;
+use crate::AccentRule;
 
 pub struct ParsedDoc {
     raw: *mut ffi::XbParsedDoc,
 }
 
 impl ParsedDoc {
+    /// Parse the HTML buffer, applying the libzim accent rule to
+    /// extracted content/keywords. For the latin rule, see
+    /// [`Self::parse_with`].
     pub fn parse(html: &[u8]) -> Option<Self> {
-        let raw = unsafe { ffi::xb_parse_html(html.as_ptr() as *const _, html.len()) };
+        Self::parse_with(html, AccentRule::Libzim)
+    }
+
+    pub fn parse_with(html: &[u8], rule: AccentRule) -> Option<Self> {
+        let rule_c = CString::new(rule.as_str()).ok()?;
+        let raw = unsafe {
+            ffi::xb_parse_html(html.as_ptr() as *const _, html.len(), rule_c.as_ptr())
+        };
         if raw.is_null() {
             None
         } else {

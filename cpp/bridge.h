@@ -23,6 +23,16 @@ typedef struct XbParsedDoc XbParsedDoc;
 // for old-style stemming (matches pre-2024 kiwix ZIMs); "" to use
 // the ICU mapping; "none" or any unknown value leaves stemming off.
 //
+// `accent_rule` selects the ICU transliterator pipeline applied to
+// titles/content/keywords before tokenisation:
+//   - "libzim" (default): "Lower; NFD; [:M:] remove; NFC" — strips
+//     ALL combining marks. Matches libzim/kiwix. Note this fragments
+//     Thai, Devanagari, and Arabic vowel-mark sequences.
+//   - "latin":  "Lower; NFD; [<latin-diacritic-blocks>] remove; NFC"
+//     — only strips combining marks used by Latin/IPA. Preserves
+//     Indic/Thai/Arabic vowel signs at the cost of byte-divergence
+//     from libzim on those scripts. Use this for non-Latin corpora.
+//
 // `keep_termlists` controls whether the WritableDatabase stores per-doc
 // termlists. libzim sets DB_NO_TERMLIST (matches modern kiwix ZIMs);
 // set this to 1 only when you need termlists for tooling that walks
@@ -32,6 +42,7 @@ XbBuilder* xb_builder_new(const char* tmp_path,
                           const char* language_iso6393,
                           const char* stopwords_text,
                           const char* stemmer_override,
+                          const char* accent_rule,
                           int keep_termlists,
                           int mode);
 void xb_builder_free(XbBuilder*);
@@ -43,10 +54,14 @@ int xb_builder_is_empty(const XbBuilder*);
 // All add_* and finalize return 0 on success, nonzero on error
 // (call xb_last_error() for a message).
 
+// `lang_override` (may be NULL or "") forwards to `Xapian::Stem`
+// for this single document, overriding the builder-level language.
+// Useful for multilingual ZIMs where per-entry language is known.
 int xb_add_title(XbBuilder*,
                  const char* path,
                  const char* title,
-                 const char* target_path /* "" if not redirect */);
+                 const char* target_path /* "" if not redirect */,
+                 const char* lang_override);
 
 // content/keywords are expected pre-processed (lowercased + accents
 // stripped) by the caller (parse_html does this for HTML inputs).
@@ -59,14 +74,17 @@ int xb_add_fulltext(XbBuilder*,
                     uint32_t word_count,
                     int has_geo,
                     double latitude,
-                    double longitude);
+                    double longitude,
+                    const char* lang_override);
 
 int xb_finalize(XbBuilder*);
 
 // Run libzim's MyHtmlParser on a UTF-8 HTML buffer. Returns NULL if
 // the HTML couldn't be parsed at all. content/keywords are returned
-// already lowercased + accent-stripped (matching libzim's pipeline).
-XbParsedDoc* xb_parse_html(const char* html, size_t len);
+// already lowercased + accent-stripped using `accent_rule`
+// (`"libzim"` or `"latin"`; see `xb_builder_new`). `accent_rule` may
+// be NULL or "" for libzim default.
+XbParsedDoc* xb_parse_html(const char* html, size_t len, const char* accent_rule);
 const char* xb_pd_content(const XbParsedDoc*, size_t* out_len);
 const char* xb_pd_keywords(const XbParsedDoc*);
 uint32_t xb_pd_word_count(const XbParsedDoc*);

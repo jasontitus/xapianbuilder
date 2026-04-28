@@ -27,6 +27,29 @@ impl Mode {
     }
 }
 
+/// Which ICU accent-removal pipeline to apply before tokenisation.
+///
+/// `Libzim` matches kiwix exactly (`"Lower; NFD; [:M:] remove; NFC"`)
+/// and fragments Indic/Thai/Arabic vowel marks as a side-effect.
+/// `Latin` only strips combining marks in the Latin/IPA blocks
+/// (`U+0300-036F`, `U+1AB0-1AFF`, `U+1DC0-1DFF`, `U+20D0-20FF`),
+/// preserving Indic/Thai/Arabic correctness at the cost of byte
+/// divergence from libzim on those scripts.
+#[derive(Copy, Clone, Debug)]
+pub enum AccentRule {
+    Libzim,
+    Latin,
+}
+
+impl AccentRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccentRule::Libzim => "libzim",
+            AccentRule::Latin => "latin",
+        }
+    }
+}
+
 pub struct Builder {
     raw: *mut ffi::XbBuilder,
     tmp_path: PathBuf,
@@ -59,6 +82,7 @@ impl Builder {
         language_iso6393: &str,
         stopwords_text: &str,
         stemmer_override: &str,
+        accent_rule: AccentRule,
         keep_termlists: bool,
         mode: Mode,
     ) -> Result<Self> {
@@ -67,6 +91,7 @@ impl Builder {
         let lang = CString::new(language_iso6393)?;
         let sw = CString::new(stopwords_text)?;
         let stemmer = CString::new(stemmer_override)?;
+        let rule = CString::new(accent_rule.as_str())?;
 
         let raw = unsafe {
             ffi::xb_builder_new(
@@ -75,6 +100,7 @@ impl Builder {
                 lang.as_ptr(),
                 sw.as_ptr(),
                 stemmer.as_ptr(),
+                rule.as_ptr(),
                 if keep_termlists { 1 } else { 0 },
                 mode.as_int(),
             )
@@ -96,12 +122,28 @@ impl Builder {
     /// Adds a title-DB document. Safe to call concurrently from
     /// multiple threads — the C++ side serialises actual database
     /// writes via an internal mutex.
-    pub fn add_title(&self, path: &str, title: &str, target_path: &str) -> Result<()> {
+    ///
+    /// `lang_override` (empty = inherit builder default) selects the
+    /// per-doc Snowball stemmer; useful for multilingual ZIMs.
+    pub fn add_title(
+        &self,
+        path: &str,
+        title: &str,
+        target_path: &str,
+        lang_override: &str,
+    ) -> Result<()> {
         let path_c = CString::new(path)?;
         let title_c = CString::new(title)?;
         let target_c = CString::new(target_path)?;
+        let lang_c = CString::new(lang_override)?;
         let rc = unsafe {
-            ffi::xb_add_title(self.raw, path_c.as_ptr(), title_c.as_ptr(), target_c.as_ptr())
+            ffi::xb_add_title(
+                self.raw,
+                path_c.as_ptr(),
+                title_c.as_ptr(),
+                target_c.as_ptr(),
+                lang_c.as_ptr(),
+            )
         };
         if rc != 0 {
             return Err(anyhow!("xb_add_title({path}): {}", last_error()));
@@ -118,10 +160,12 @@ impl Builder {
         keywords: &str,
         word_count: u32,
         geo: Option<(f64, f64)>,
+        lang_override: &str,
     ) -> Result<()> {
         let path_c = CString::new(path)?;
         let title_c = CString::new(title)?;
         let keywords_c = CString::new(keywords)?;
+        let lang_c = CString::new(lang_override)?;
         // Content may contain interior NULs in pathological inputs; we
         // strip them so CString creation succeeds.
         let content_c = if content.contains('\0') {
@@ -145,6 +189,7 @@ impl Builder {
                 has_geo,
                 lat,
                 lng,
+                lang_c.as_ptr(),
             )
         };
         if rc != 0 {

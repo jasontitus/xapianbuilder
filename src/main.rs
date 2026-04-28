@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use xapianbuilder::{Builder, Mode, parse::ParsedDoc, stopwords};
+use xapianbuilder::{AccentRule, Builder, Mode, parse::ParsedDoc, stopwords};
 
 /// Parallel-pipeline chunk size — the JSONL reader buffers up to
 /// CHUNK lines, then dispatches them across worker threads. Larger
@@ -88,6 +88,14 @@ struct BuildArgs {
     /// won't byte-match a kiwix-built reference.
     #[arg(long)]
     keep_termlists: bool,
+    /// ICU accent-removal pipeline. `libzim` (default) matches kiwix
+    /// exactly: `Lower; NFD; [:M:] remove; NFC`. That fragments
+    /// Indic/Thai/Arabic vowel marks. Pass `latin` to only strip
+    /// Latin/IPA combining marks; non-Latin scripts pass through and
+    /// tokenize correctly, at the cost of byte-divergence from libzim
+    /// on those corpora.
+    #[arg(long, value_parser = ["libzim", "latin"], default_value = "libzim")]
+    accent_rule: String,
     /// Suppress progress output.
     #[arg(long)]
     quiet: bool,
@@ -101,12 +109,12 @@ struct InputDoc {
     mimetype: String,
     #[serde(default)]
     body: String,
-    /// Optional per-document override for the language selected at the
-    /// CLI. If both are unset we skip stemming. Currently ignored (CLI
-    /// language is authoritative) — accepted so callers can ship the
-    /// field today.
+    /// Optional per-document override for the stemmer language. Empty
+    /// or absent means "use the CLI `--language` default". Forwarded
+    /// to `Xapian::Stem` (so the literal `english`, `porter`, or any
+    /// Snowball language name works), with an ICU fallback for
+    /// ISO-639-3 codes (`eng` → `en`).
     #[serde(default)]
-    #[allow(dead_code)]
     language: Option<String>,
     /// Set on title-DB inputs that are redirects.
     #[serde(default)]
@@ -147,12 +155,17 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
     } else {
         stopwords::for_language(&args.language)
     };
+    let accent_rule = match args.accent_rule.as_str() {
+        "latin" => AccentRule::Latin,
+        _ => AccentRule::Libzim,
+    };
     let builder = Builder::new(
         &tmp,
         &args.output,
         &args.language,
         stopwords_text,
         &args.stemmer,
+        accent_rule,
         args.keep_termlists,
         mode,
     )?;
@@ -189,7 +202,7 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
         let prepared: Vec<Result<Prepared>> = match mode {
             Mode::Fulltext => chunk
                 .par_iter()
-                .map(|line| prepare_fulltext(line))
+                .map(|line| prepare_fulltext(line, accent_rule))
                 .collect(),
             Mode::Title => chunk
                 .par_iter()
@@ -199,14 +212,14 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
         for res in prepared {
             match res? {
                 Prepared::Skip => continue,
-                Prepared::Title { path, title, target_path } => {
-                    builder.add_title(&path, &title, &target_path)?;
+                Prepared::Title { path, title, target_path, lang } => {
+                    builder.add_title(&path, &title, &target_path, &lang)?;
                 }
                 Prepared::Fulltext {
-                    path, title, content, keywords, word_count, geo,
+                    path, title, content, keywords, word_count, geo, lang,
                 } => {
                     builder.add_fulltext(
-                        &path, &title, &content, &keywords, word_count, geo,
+                        &path, &title, &content, &keywords, word_count, geo, &lang,
                     )?;
                 }
             }
@@ -256,6 +269,7 @@ enum Prepared {
         path: String,
         title: String,
         target_path: String,
+        lang: String,
     },
     Fulltext {
         path: String,
@@ -264,6 +278,7 @@ enum Prepared {
         keywords: String,
         word_count: u32,
         geo: Option<(f64, f64)>,
+        lang: String,
     },
 }
 
@@ -274,15 +289,16 @@ fn prepare_title(line: &str) -> Result<Prepared> {
         path: doc.path,
         title: doc.title,
         target_path: doc.target_path.unwrap_or_default(),
+        lang: doc.language.unwrap_or_default(),
     })
 }
 
-fn prepare_fulltext(line: &str) -> Result<Prepared> {
+fn prepare_fulltext(line: &str, rule: AccentRule) -> Result<Prepared> {
     let doc: InputDoc = serde_json::from_str(line)
         .with_context(|| format!("parsing JSONL: {}", line.chars().take(80).collect::<String>()))?;
 
     let parsed = if doc.mimetype.starts_with("text/html") {
-        ParsedDoc::parse(doc.body.as_bytes())
+        ParsedDoc::parse_with(doc.body.as_bytes(), rule)
     } else {
         None
     };
@@ -320,6 +336,7 @@ fn prepare_fulltext(line: &str) -> Result<Prepared> {
         keywords,
         word_count,
         geo,
+        lang: doc.language.unwrap_or_default(),
     })
 }
 

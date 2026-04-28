@@ -18,6 +18,7 @@
 
 #include <cctype>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -36,24 +37,48 @@ void set_error(const std::string& msg) { g_last_error = msg; }
 
 // ---- Accent removal + lowercasing (mirrors libzim's removeAccents) ----
 //
-// Rule string is identical to libzim's: "Lower; NFD; [:M:] remove; NFC".
-// The transliterator is created lazily and reused across calls.
+// Two rules:
+//   - libzim: "Lower; NFD; [:M:] remove; NFC" — strips every combining
+//     mark, regardless of script. Identical to libzim. Fragments Thai
+//     vowel-sign sequences (U+0E30-0E3A) and Indic vowel marks; the
+//     downstream tokeniser then produces consonant-cluster tokens.
+//   - latin:  same shape, but only the four "Combining Diacritical
+//     Marks*" blocks (used by Latin/IPA/symbols) are stripped. Indic /
+//     Thai / Arabic vowel marks survive.
+//
+// The transliterator is built once per rule and reused across calls.
 
-icu::Transliterator* get_translit() {
-    static UErrorCode status = U_ZERO_ERROR;
-    static std::unique_ptr<icu::Transliterator> t(
-        icu::Transliterator::createInstance(
-            "Lower; NFD; [:M:] remove; NFC", UTRANS_FORWARD, status));
-    return t.get();
+constexpr const char* RULE_LIBZIM =
+    "Lower; NFD; [:M:] remove; NFC";
+// Combining Diacritical Marks blocks: 0300-036F + 1AB0-1AFF (Extended)
+// + 1DC0-1DFF (Supplement) + 20D0-20FF (for Symbols). These cover
+// Latin/Greek/Cyrillic/IPA accent removal; Thai/Devanagari/Arabic vowel
+// signs live elsewhere and pass through.
+constexpr const char* RULE_LATIN_ONLY =
+    "Lower; NFD; "
+    "[\\u0300-\\u036F\\u1AB0-\\u1AFF\\u1DC0-\\u1DFF\\u20D0-\\u20FF] remove; "
+    "NFC";
+
+icu::Transliterator* build_translit(const std::string& rule_id) {
+    UErrorCode status = U_ZERO_ERROR;
+    const char* rule = (rule_id == "latin") ? RULE_LATIN_ONLY : RULE_LIBZIM;
+    // Use createInstance (compound-ID parser), exactly like libzim.
+    // createFromRules(...) takes a different rule grammar that doesn't
+    // parse "Lower; NFD; [...] remove; NFC" the way we want.
+    icu::UnicodeString id(rule, "UTF-8");
+    icu::Transliterator* t =
+        icu::Transliterator::createInstance(id, UTRANS_FORWARD, status);
+    if (U_FAILURE(status)) return nullptr;
+    return t;
 }
 
-std::string remove_accents_lower(const std::string& s) {
-    if (s.empty() || !get_translit()) return s;
+std::string remove_accents_lower_with(icu::Transliterator* t, const std::string& s) {
+    if (s.empty() || !t) return s;
     icu::UnicodeString us = icu::UnicodeString::fromUTF8(s);
 
     constexpr int32_t BATCH = 4 * 1024;
     if (us.length() <= BATCH) {
-        get_translit()->transliterate(us);
+        t->transliterate(us);
         std::string out;
         us.toUTF8String(out);
         return out;
@@ -67,11 +92,23 @@ std::string remove_accents_lower(const std::string& s) {
         int32_t len = end - pos;
         chunk.remove();
         us.extract(pos, len, chunk);
-        get_translit()->transliterate(chunk);
+        t->transliterate(chunk);
         chunk.toUTF8String(out);
         pos += len;
     }
     return out;
+}
+
+// Default-rule accessor used by paths that pre-date per-builder
+// configurability (e.g. parse_html). They get the libzim rule, which
+// is the safest "match what kiwix does" default.
+icu::Transliterator* get_default_translit() {
+    static std::unique_ptr<icu::Transliterator> t(build_translit("libzim"));
+    return t.get();
+}
+
+std::string remove_accents_lower(const std::string& s) {
+    return remove_accents_lower_with(get_default_translit(), s);
 }
 
 // ASCII-whitespace word counter (mirrors libzim's countWords).
@@ -118,11 +155,19 @@ struct XbBuilder {
     std::string tmp_path;
     std::string final_path;
     std::string language;          // ISO-639-3 (stored in metadata)
-    std::string stemmer_language;  // resolved stemmer string ("" = none)
+    std::string default_stemmer;   // "" = no stemming
+    std::string accent_rule;       // "libzim" | "latin"
     Xapian::SimpleStopper stopper; // populated from stopwords text
     int mode;                      // 0=title, 1=fulltext
     bool empty = true;
     std::mutex db_mu;              // matches libzim's s_dbaccessLock
+    // Per-language stemmer cache. Built lazily; reads + insertions
+    // are mutex-protected.
+    std::map<std::string, Xapian::Stem> stem_cache;
+    // Owned transliterator for the chosen accent rule. The default
+    // rule's transliterator comes from get_default_translit();
+    // builders that pick "latin" hold their own copy.
+    std::unique_ptr<icu::Transliterator> translit;
 };
 
 extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
@@ -130,6 +175,7 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
                                      const char* language_iso6393,
                                      const char* stopwords_text,
                                      const char* stemmer_override,
+                                     const char* accent_rule,
                                      int keep_termlists,
                                      int mode) {
     try {
@@ -140,11 +186,16 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
         b->language = language_iso6393 ? language_iso6393 : "";
         const std::string ovr = stemmer_override ? stemmer_override : "";
         if (ovr == "none") {
-            b->stemmer_language = "";
+            b->default_stemmer = "";
         } else if (!ovr.empty()) {
-            b->stemmer_language = ovr;
+            b->default_stemmer = ovr;
         } else {
-            b->stemmer_language = stemmer_lang_for(b->language);
+            b->default_stemmer = stemmer_lang_for(b->language);
+        }
+        const std::string rule = accent_rule ? accent_rule : "libzim";
+        b->accent_rule = (rule == "latin") ? "latin" : "libzim";
+        if (b->accent_rule == "latin") {
+            b->translit.reset(build_translit("latin"));
         }
         b->mode = mode;
 
@@ -194,10 +245,59 @@ extern "C" int xb_builder_is_empty(const XbBuilder* b) {
     return (b && !b->empty) ? 0 : 1;
 }
 
+// Resolve the stemmer string for a per-doc invocation: explicit
+// override wins, otherwise fall back to the builder default. Cache
+// the resulting Stem objects (creation isn't free for every call).
+//
+// Caller must hold `b->db_mu` while calling — we reuse the same mutex
+// to keep the cache map racing-free without introducing a second
+// lock.
+static const Xapian::Stem* resolve_stem(XbBuilder* b, const char* lang_override) {
+    std::string key;
+    const std::string ovr = lang_override ? lang_override : "";
+    if (ovr == "none") {
+        return nullptr;
+    } else if (!ovr.empty()) {
+        // Treat the override as either ISO-639-3 (translate via ICU)
+        // or a literal Snowball language string. We try the literal
+        // first (fast path); ICU resolution is only invoked when
+        // direct construction fails.
+        key = ovr;
+    } else {
+        key = b->default_stemmer;
+    }
+    if (key.empty()) return nullptr;
+
+    auto it = b->stem_cache.find(key);
+    if (it != b->stem_cache.end()) return &it->second;
+
+    // Try literal first.
+    try {
+        auto [iter, _] = b->stem_cache.emplace(key, Xapian::Stem(key));
+        return &iter->second;
+    } catch (...) {}
+
+    // Fall back to ICU language-code resolution (handles "eng" -> "en").
+    std::string resolved = stemmer_lang_for(key);
+    if (!resolved.empty() && resolved != key) {
+        try {
+            auto [iter, _] = b->stem_cache.emplace(key, Xapian::Stem(resolved));
+            return &iter->second;
+        } catch (...) {}
+    }
+    // Cache the failure as an empty Stem-less entry so we don't
+    // reattempt construction on every call. We do this by NOT
+    // inserting; lookups for the same key will retry. That's a
+    // minor inefficiency but keeps the map's invariant simple
+    // (every entry is a valid stemmer).
+    return nullptr;
+}
+
 extern "C" int xb_add_title(XbBuilder* b,
                             const char* path,
                             const char* title,
-                            const char* target_path) {
+                            const char* target_path,
+                            const char* lang_override) {
     if (!b || b->mode != 0) {
         set_error("xb_add_title: builder is not in title mode");
         return -1;
@@ -210,13 +310,13 @@ extern "C" int xb_add_title(XbBuilder* b,
         Xapian::TermGenerator indexer;
         indexer.set_max_word_length(MAX_INDEXABLE_TITLE_WORD_SIZE);
         indexer.set_flags(Xapian::TermGenerator::FLAG_CJK_NGRAM);
-        if (!b->stemmer_language.empty()) {
-            try {
-                Xapian::Stem s(b->stemmer_language);
-                indexer.set_stemmer(s);
-                indexer.set_stemming_strategy(
-                    Xapian::TermGenerator::STEM_SOME);
-            } catch (...) {}
+        // Stemmer resolution touches b->stem_cache, guarded by db_mu.
+        std::lock_guard<std::mutex> lock(b->db_mu);
+        const Xapian::Stem* s = resolve_stem(b, lang_override);
+        if (s) {
+            indexer.set_stemmer(*s);
+            indexer.set_stemming_strategy(
+                Xapian::TermGenerator::STEM_SOME);
         }
 
         Xapian::Document doc;
@@ -224,7 +324,8 @@ extern "C" int xb_add_title(XbBuilder* b,
         doc.set_data(full_path);
         indexer.set_document(doc);
 
-        std::string unaccented = remove_accents_lower(title_s);
+        icu::Transliterator* t = b->translit ? b->translit.get() : get_default_translit();
+        std::string unaccented = remove_accents_lower_with(t, title_s);
 
         doc.add_value(0, title_s);
         doc.add_value(1, target_s.empty() ? path_s : target_s);
@@ -248,7 +349,8 @@ extern "C" int xb_add_title(XbBuilder* b,
             }
         }
 
-        std::lock_guard<std::mutex> lock(b->db_mu);
+        // db_mu is already held above for stemmer resolution; reuse
+        // it for the actual add_document call.
         b->db.add_document(doc);
         b->empty = false;
         return 0;
@@ -270,7 +372,8 @@ extern "C" int xb_add_fulltext(XbBuilder* b,
                                uint32_t word_count,
                                int has_geo,
                                double latitude,
-                               double longitude) {
+                               double longitude,
+                               const char* lang_override) {
     if (!b || b->mode != 1) {
         set_error("xb_add_fulltext: builder is not in fulltext mode");
         return -1;
@@ -283,13 +386,12 @@ extern "C" int xb_add_fulltext(XbBuilder* b,
 
         Xapian::TermGenerator indexer;
         indexer.set_flags(Xapian::TermGenerator::FLAG_CJK_NGRAM);
-        if (!b->stemmer_language.empty()) {
-            try {
-                Xapian::Stem s(b->stemmer_language);
-                indexer.set_stemmer(s);
-                indexer.set_stemming_strategy(
-                    Xapian::TermGenerator::STEM_ALL);
-            } catch (...) {}
+        std::lock_guard<std::mutex> lock(b->db_mu);
+        const Xapian::Stem* s = resolve_stem(b, lang_override);
+        if (s) {
+            indexer.set_stemmer(*s);
+            indexer.set_stemming_strategy(
+                Xapian::TermGenerator::STEM_ALL);
         }
         indexer.set_stopper(&b->stopper);
         indexer.set_stopper_strategy(Xapian::TermGenerator::STOP_ALL);
@@ -320,7 +422,7 @@ extern "C" int xb_add_fulltext(XbBuilder* b,
         if (!keywords_s.empty())
             indexer.index_text_without_positions(keywords_s, 3);
 
-        std::lock_guard<std::mutex> lock(b->db_mu);
+        // db_mu already held above for stemmer resolution.
         b->db.add_document(doc);
         b->empty = false;
         return 0;
@@ -363,7 +465,17 @@ struct XbParsedDoc {
     double longitude;
 };
 
-extern "C" XbParsedDoc* xb_parse_html(const char* html, size_t len) {
+// Cached transliterator for `xb_parse_html`. The libzim default is
+// reused across calls; the latin rule is built once on first use.
+icu::Transliterator* get_translit_for_rule(const std::string& rule) {
+    if (rule == "latin") {
+        static std::unique_ptr<icu::Transliterator> t(build_translit("latin"));
+        return t.get();
+    }
+    return get_default_translit();
+}
+
+extern "C" XbParsedDoc* xb_parse_html(const char* html, size_t len, const char* accent_rule) {
     try {
         zim::MyHtmlParser parser;
         std::string body(html ? html : "", html ? len : 0);
@@ -382,8 +494,10 @@ extern "C" XbParsedDoc* xb_parse_html(const char* html, size_t len) {
         p->has_geo = parser.has_geoPosition;
         p->latitude = parser.latitude;
         p->longitude = parser.longitude;
-        p->content = remove_accents_lower(parser.dump);
-        p->keywords = remove_accents_lower(parser.keywords);
+        const std::string rule = accent_rule ? accent_rule : "";
+        icu::Transliterator* t = get_translit_for_rule(rule);
+        p->content = remove_accents_lower_with(t, parser.dump);
+        p->keywords = remove_accents_lower_with(t, parser.keywords);
         return p;
     } catch (const std::exception& e) {
         set_error(std::string("xb_parse_html: ") + e.what());

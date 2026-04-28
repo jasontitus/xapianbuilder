@@ -108,8 +108,26 @@ Common options:
                             parallel; database writes are serialised
                             in input order so doc IDs stay stable
                             regardless of --jobs.
+  --keep-termlists          Store per-doc termlists. Off by default
+                            (matches modern kiwix; libzim uses
+                            DB_NO_TERMLIST).
+  --accent-rule <RULE>      ICU pipeline applied to titles/content/
+                            keywords:
+                              libzim (default): Lower; NFD; [:M:]
+                                  remove; NFC — exact kiwix match,
+                                  fragments Indic/Thai/Arabic vowel
+                                  marks as a side effect.
+                              latin: only strips Latin/IPA combining
+                                  marks (U+0300..036F + extended
+                                  blocks). Preserves non-Latin
+                                  scripts; diverges from kiwix on
+                                  those corpora.
   --quiet                   Suppress progress output.
 ```
+
+The JSONL `language` field is per-document and overrides `--language`
+for that one entry — useful for multilingual ZIMs that need different
+stemmers per article. Empty / absent inherits the CLI default.
 
 Exit codes: 0 on success, nonzero on any error (message on stderr).
 
@@ -336,10 +354,33 @@ through xapianbuilder, diffed against the canonical fulltext DB:
 | Doc length        | **199 / 200 exact** |
 | File metadata     | identical (kind, valuesmap, data, language) |
 
-The single outlier is a Thai-language article — combining-mark
-stripping (which both we and libzim do) interacts oddly with Thai
-vowel signs, but the divergence is per-doc and doesn't affect the
-other 199.
+The single outlier is a Thai-language article. Pass
+`--accent-rule latin` to preserve Thai vowel signs at indexing time
+(at the cost of byte-divergence from libzim on this corpus); see
+[Accent rule trade-offs](#accent-rule-trade-offs) below.
+
+### Accent rule trade-offs
+
+The default `libzim` rule (`Lower; NFD; [:M:] remove; NFC`) strips
+every Unicode combining mark, regardless of script. That's correct
+for Latin — `é → e`, `ñ → n` — but fragments Indic, Thai, and
+Arabic vowel-mark sequences (those scripts use Mn/Mc-class marks for
+*vowels*, not just diacritics, so stripping them is destructive).
+
+`--accent-rule latin` only strips the Latin/IPA combining-mark
+blocks (`U+0300..036F`, `U+1AB0..1AFF`, `U+1DC0..1DFF`,
+`U+20D0..20FF`). On the same 200-doc 2025 sample:
+
+|                | libzim (default) | latin |
+|---             |---               |---    |
+| Doc length match | 199 / 200      | 120 / 200 |
+
+Latin scores worse on this corpus because libzim's broader rule also
+strips Hebrew points, Arabic harakat, and other Mn-class marks
+outside the Latin blocks. For pure-Latin Wikipedia content the
+default wins. For multilingual or Indic/Thai/Arabic-heavy ZIMs,
+`--accent-rule latin` will produce more searchable indexes at the
+cost of byte-divergence from kiwix-built references.
 
 ### Against an older sample (`wikipedia_en_100_maxi_2024-01`)
 
@@ -361,9 +402,15 @@ match.
 
 ## Known limitations / next steps
 
-- **End-to-end CJK/RTL coverage untested.** `FLAG_CJK_NGRAM` is set
-  and ICU handles every script in accent removal, but no fixture run
-  yet against Chinese / Arabic / Japanese ZIMs.
+- **Thai still bigram-fragments under `--accent-rule latin`** because
+  Xapian's `FLAG_CJK_NGRAM` triggers on broad Asian-script ranges
+  (not strict CJK). Disabling the flag would break Chinese/Japanese
+  search; per-script tokenizer overrides require Xapian-internal
+  changes.
+- **`--accent-rule latin` is byte-divergent from libzim** on Latin
+  corpora at ~1 doc-position per few hundred (Hebrew points, Arabic
+  harakat, and other non-Latin Mn marks libzim strips and we don't).
+  Default stays `libzim` to preserve byte-compat.
 - **Per-doc language override unused.** The JSONL `language` field is
   parsed but ignored — CLI `--language` wins. Wire this through if we
   start seeing mixed-language ZIMs (`zh-Hant` + `en` etc.).

@@ -116,6 +116,77 @@ fn skip_if_empty_omits_file() {
 }
 
 #[test]
+fn per_doc_language_overrides_cli() {
+    // Two docs, same body content; one tagged "porter" (Porter1) and
+    // one tagged "english" (Porter2). The resulting term lists must
+    // differ — Porter1 stems "international" -> "intern", Porter2
+    // -> "internat".
+    let dir = workdir("per_doc_lang");
+    let input = dir.join("mixed.jsonl");
+    std::fs::write(&input,
+        "{\"path\":\"a\",\"title\":\"A\",\"mimetype\":\"text/html\",\"language\":\"porter\",\"body\":\"<html><body>international universities are good</body></html>\"}\n\
+         {\"path\":\"b\",\"title\":\"B\",\"mimetype\":\"text/html\",\"language\":\"english\",\"body\":\"<html><body>international universities are good</body></html>\"}\n",
+    ).unwrap();
+    let out = dir.join("mixed.xapian");
+    let status = Command::new(bin())
+        .args(["fulltext", "--input"]).arg(&input)
+        .args(["--output"]).arg(&out)
+        // Note: no CLI --language; per-doc fields must drive stemming.
+        .args(["--keep-termlists", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    if !xapian_delve_available() { return; }
+    let terms_for = |docid: &str| -> String {
+        let out_str = Command::new("xapian-delve")
+            .args(["-1", "-r", docid]).arg(&out)
+            .output().unwrap().stdout;
+        String::from_utf8_lossy(&out_str).into_owned()
+    };
+    let porter1 = terms_for("1");
+    let porter2 = terms_for("2");
+    // Porter1 stems "international" -> "intern", "universities" -> "univers".
+    // Porter2 leaves "international" -> "internat", "universities" -> "universiti".
+    assert!(porter1.contains("intern"), "doc1 (porter): expected 'intern' stem; got {porter1}");
+    assert!(porter2.contains("internat"), "doc2 (english): expected 'internat' stem; got {porter2}");
+}
+
+#[test]
+fn accent_rule_latin_preserves_indic_marks() {
+    // Devanagari "क" + vowel sign "ि" forms "कि". With libzim rule
+    // (`[:M:] remove`), the vowel sign is stripped and the input
+    // becomes a bare "क" — fragmenting the syllable. With the latin
+    // rule, the sequence is preserved end-to-end.
+    let dir = workdir("accent_indic");
+    let input = dir.join("hi.jsonl");
+    std::fs::write(&input,
+        "{\"path\":\"a\",\"title\":\"x\",\"mimetype\":\"text/html\",\"body\":\"<html><body>कितना अच्छा</body></html>\"}\n",
+    ).unwrap();
+
+    for (rule, expect_mark) in [("libzim", false), ("latin", true)] {
+        let out = dir.join(format!("{rule}.xapian"));
+        let _ = std::fs::remove_file(&out);
+        Command::new(bin())
+            .args(["fulltext", "--input"]).arg(&input)
+            .args(["--output"]).arg(&out)
+            .args(["--accent-rule", rule, "--keep-termlists", "--quiet"])
+            .status().unwrap();
+        if !xapian_delve_available() { return; }
+        let out_str = Command::new("xapian-delve")
+            .args(["-1", "-r", "1"]).arg(&out)
+            .output().unwrap().stdout;
+        let listing = String::from_utf8_lossy(&out_str);
+        // The vowel sign U+093F appears iff the rule preserved it.
+        let has_vowel_sign = listing.contains('\u{093f}');
+        assert_eq!(
+            has_vowel_sign, expect_mark,
+            "rule={rule}: expected vowel-sign-preserved={expect_mark}, got {has_vowel_sign}\n{listing}"
+        );
+    }
+}
+
+#[test]
 fn stemmer_override_changes_terms() {
     let dir = workdir("stemmer_override");
     let porter2_out = dir.join("p2.xapian");
@@ -147,6 +218,85 @@ fn stemmer_override_changes_terms() {
     // a word like "international" to the fixture.
     assert!(porter2_out.exists());
     assert!(porter1_out.exists());
+}
+
+#[test]
+fn cjk_ngrams_produce_bigram_tokens() {
+    // FLAG_CJK_NGRAM should emit overlapping bigrams for runs of CJK
+    // characters. "中国语言" (Chinese language) — four CJK chars —
+    // should yield three bigrams: 中国, 国语, 语言. We only assert
+    // the bigrams are present; the exact set of additional unigrams
+    // depends on Xapian's tokenizer internals.
+    let dir = workdir("cjk");
+    let input = dir.join("zh.jsonl");
+    std::fs::write(&input,
+        "{\"path\":\"a\",\"title\":\"x\",\"mimetype\":\"text/html\",\"language\":\"zh\",\"body\":\"<html><body>中国语言研究</body></html>\"}\n",
+    ).unwrap();
+    let out = dir.join("zh.xapian");
+    Command::new(bin())
+        .args(["fulltext", "--input"]).arg(&input)
+        .args(["--output"]).arg(&out)
+        .args(["--keep-termlists", "--quiet"])
+        .status().unwrap();
+
+    if !xapian_delve_available() { return; }
+    let listing = String::from_utf8_lossy(
+        &Command::new("xapian-delve")
+            .args(["-1", "-r", "1"]).arg(&out)
+            .output().unwrap().stdout
+    ).into_owned();
+    for bigram in ["中国", "国语", "语言", "言研", "研究"] {
+        assert!(
+            listing.contains(bigram),
+            "missing CJK bigram '{bigram}' in term list:\n{listing}"
+        );
+    }
+}
+
+#[test]
+fn thai_marks_preserved_under_latin_rule() {
+    // Thai "ความรัก" (love). The vowel sign `ั` (U+0E31) is Mn. With
+    // libzim rule it's stripped before tokenisation; with latin it
+    // survives. We don't assert on the full word because Xapian's
+    // FLAG_CJK_NGRAM (which we keep enabled for Chinese/Japanese)
+    // bigram-tokenises Thai too, fragmenting it either way. What
+    // *changes* between rules is whether the vowel signs reach the
+    // tokenizer at all.
+    let dir = workdir("thai_rules");
+    let input = dir.join("th.jsonl");
+    std::fs::write(&input,
+        "{\"path\":\"a\",\"title\":\"x\",\"mimetype\":\"text/html\",\"body\":\"<html><body>ความรัก</body></html>\"}\n",
+    ).unwrap();
+
+    let read_terms = |rule: &str| -> String {
+        let out = dir.join(format!("{rule}.xapian"));
+        let _ = std::fs::remove_file(&out);
+        Command::new(bin())
+            .args(["fulltext", "--input"]).arg(&input)
+            .args(["--output"]).arg(&out)
+            .args(["--accent-rule", rule, "--keep-termlists", "--quiet"])
+            .status().unwrap();
+        if !xapian_delve_available() { return String::new(); }
+        String::from_utf8_lossy(
+            &Command::new("xapian-delve")
+                .args(["-1", "-r", "1"]).arg(&out)
+                .output().unwrap().stdout
+        ).into_owned()
+    };
+
+    let libzim_terms = read_terms("libzim");
+    let latin_terms = read_terms("latin");
+    if libzim_terms.is_empty() { return; }
+
+    let vowel_sign = '\u{0E31}';
+    assert!(
+        latin_terms.contains(vowel_sign),
+        "latin rule should preserve U+0E31; got: {latin_terms}"
+    );
+    assert!(
+        !libzim_terms.contains(vowel_sign),
+        "libzim rule should strip U+0E31; got: {libzim_terms}"
+    );
 }
 
 // ---- helpers using xapian-delve (skipped if unavailable) ----------

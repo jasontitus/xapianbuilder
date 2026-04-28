@@ -19,6 +19,7 @@ unsafe extern "C" {
         language_iso6393: *const c_char,
         stopwords_text: *const c_char,
         stemmer_override: *const c_char,
+        accent_rule: *const c_char,
         keep_termlists: c_int,
         mode: c_int,
     ) -> *mut XbBuilder;
@@ -32,6 +33,7 @@ unsafe extern "C" {
         path: *const c_char,
         title: *const c_char,
         target_path: *const c_char,
+        lang_override: *const c_char,
     ) -> c_int;
 
     pub fn xb_add_fulltext(
@@ -45,11 +47,16 @@ unsafe extern "C" {
         has_geo: c_int,
         latitude: c_double,
         longitude: c_double,
+        lang_override: *const c_char,
     ) -> c_int;
 
     pub fn xb_finalize(b: *mut XbBuilder) -> c_int;
 
-    pub fn xb_parse_html(html: *const c_char, len: usize) -> *mut XbParsedDoc;
+    pub fn xb_parse_html(
+        html: *const c_char,
+        len: usize,
+        accent_rule: *const c_char,
+    ) -> *mut XbParsedDoc;
     pub fn xb_pd_content(p: *const XbParsedDoc, out_len: *mut usize) -> *const c_char;
     pub fn xb_pd_keywords(p: *const XbParsedDoc) -> *const c_char;
     pub fn xb_pd_word_count(p: *const XbParsedDoc) -> c_uint;
