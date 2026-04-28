@@ -19,6 +19,7 @@ unsafe extern "C" {
         language_iso6393: *const c_char,
         stopwords_text: *const c_char,
         stemmer_override: *const c_char,
+        keep_termlists: c_int,
         mode: c_int,
     ) -> *mut XbBuilder;
 

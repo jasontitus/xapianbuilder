@@ -322,30 +322,42 @@ The boundary rules for contributors:
 
 ## Verification
 
-Building from a 100-article fixture extracted from kiwix's
-`wikipedia_en_100_maxi_2024-01.zim` and diffing against the canonical
-Xapian DB inside that ZIM:
+### Against modern libzim (`wikipedia_en_movies_nopic_2025-08`)
 
-| Comparison              | Result      |
-| ----------------------- | ----------- |
-| Document count          | 100 / 100 ✓ |
-| Magic + format          | identical   |
-| Avg doc length          | 18038 vs 18046 (0.04% diff) |
-| Per-doc term overlap    | **99.87%** (canonical-side) |
-| Per-doc unique-term diff | 431 of ~360k tokens |
+200-doc subset extracted from a 2025-vintage kiwix ZIM, fed back
+through xapianbuilder, diffed against the canonical fulltext DB:
+
+| Comparison        | Result        |
+| ----------------- | ------------- |
+| Path / doc data   | 200 / 200 ✓   |
+| `value[0]` (title) | 200 / 200 ✓   |
+| `value[1]` (wordcount) | 200 / 200 ✓ |
+| `value[2]` (geo)  | 200 / 200 ✓   |
+| Doc length        | **199 / 200 exact** |
+| File metadata     | identical (kind, valuesmap, data, language) |
+
+The single outlier is a Thai-language article — combining-mark
+stripping (which both we and libzim do) interacts oddly with Thai
+vowel signs, but the divergence is per-doc and doesn't affect the
+other 199.
+
+### Against an older sample (`wikipedia_en_100_maxi_2024-01`)
+
+Earlier 100-article fixture from a 2024-01 ZIM:
+
+| Comparison            | Result   |
+| --------------------- | -------- |
+| Per-doc term overlap  | 99.87%   |
+| Per-doc unique-term diff | 431 of ~360k |
 
 The remaining diff is **stemmer-version drift**: the 2024-01 sample
 was built with a stemmer that aggressively stems some words that
-modern Porter2 leaves alone (`internal → intern`, `university → univers`,
-`emergency → emerg`) but leaves common words like `they/this/was` /
-`-ist` nouns alone. No single Xapian stemmer reproduces that pattern
-exactly — looks like a custom or pre-1.4-Snowball variant. xapianbuilder
-defaults to Porter2 (matches current libzim); pass `--stemmer porter`
-for the closest old-ZIM match.
-
-Modern kiwix.org ZIMs should match xapianbuilder's default output
-much more closely; verifying against a 2025-vintage ZIM is the next
-on-deck item.
+modern Porter2 leaves alone (`internal → intern`, `university → univers`)
+but keeps common words like `they/this/was` unchanged. No single
+Xapian stemmer reproduces that pattern exactly — looks like a custom
+pre-1.4-Snowball variant. xapianbuilder defaults to Porter2 (matches
+current libzim); pass `--stemmer porter` for the closest old-ZIM
+match.
 
 ## Known limitations / next steps
 
@@ -355,6 +367,10 @@ on-deck item.
 - **Per-doc language override unused.** The JSONL `language` field is
   parsed but ignored — CLI `--language` wins. Wire this through if we
   start seeing mixed-language ZIMs (`zh-Hant` + `en` etc.).
-- **No verification against a 2025-vintage ZIM yet.** Target: pull a
-  fresh `wikipedia_en_*` from kiwix.org/library and re-run the term
-  diff. Expecting >99.99% overlap.
+- **One known doc-level divergence on Thai-language content.** When
+  combining-mark stripping (`Lower; NFD; [:M:] remove; NFC` — same
+  ICU rules libzim uses) hits Thai vowel signs (Mn class) but not
+  Thai vowel letters (Lo class), some Thai words fragment into
+  consonant clusters that tokenize differently. Affects ~1 in 200
+  docs in the 2025-08 movies test ZIM; per-doc, not systemic. Worth
+  fixing if we ship multilingual ZIMs.

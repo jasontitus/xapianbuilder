@@ -22,11 +22,17 @@ typedef struct XbParsedDoc XbParsedDoc;
 // non-empty, bypassing the ICU-derived language code. Pass "porter"
 // for old-style stemming (matches pre-2024 kiwix ZIMs); "" to use
 // the ICU mapping; "none" or any unknown value leaves stemming off.
+//
+// `keep_termlists` controls whether the WritableDatabase stores per-doc
+// termlists. libzim sets DB_NO_TERMLIST (matches modern kiwix ZIMs);
+// set this to 1 only when you need termlists for tooling that walks
+// documents term-by-term (e.g. xapian-delve -1 -r N).
 XbBuilder* xb_builder_new(const char* tmp_path,
                           const char* final_path,
                           const char* language_iso6393,
                           const char* stopwords_text,
                           const char* stemmer_override,
+                          int keep_termlists,
                           int mode);
 void xb_builder_free(XbBuilder*);
 

@@ -81,6 +81,13 @@ struct BuildArgs {
     /// bridge, matching libzim's `s_dbaccessLock` design.
     #[arg(long, default_value_t = 0)]
     jobs: usize,
+    /// Store per-doc termlists in the output DB. Default off — matches
+    /// modern kiwix ZIMs (libzim sets DB_NO_TERMLIST). Turn this on
+    /// when you need to walk terms per document (e.g. for
+    /// `xapian-delve -1 -r N`); the resulting DB will be larger and
+    /// won't byte-match a kiwix-built reference.
+    #[arg(long)]
+    keep_termlists: bool,
     /// Suppress progress output.
     #[arg(long)]
     quiet: bool,
@@ -146,6 +153,7 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
         &args.language,
         stopwords_text,
         &args.stemmer,
+        args.keep_termlists,
         mode,
     )?;
 

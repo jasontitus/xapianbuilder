@@ -59,6 +59,7 @@ impl Builder {
         language_iso6393: &str,
         stopwords_text: &str,
         stemmer_override: &str,
+        keep_termlists: bool,
         mode: Mode,
     ) -> Result<Self> {
         let tmp = path_to_cstring(tmp_path)?;
@@ -74,6 +75,7 @@ impl Builder {
                 lang.as_ptr(),
                 sw.as_ptr(),
                 stemmer.as_ptr(),
+                if keep_termlists { 1 } else { 0 },
                 mode.as_int(),
             )
         };

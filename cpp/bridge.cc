@@ -130,6 +130,7 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
                                      const char* language_iso6393,
                                      const char* stopwords_text,
                                      const char* stemmer_override,
+                                     int keep_termlists,
                                      int mode) {
     try {
         ucnv_setDefaultName("UTF-8");
@@ -155,15 +156,15 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
             if (!word.empty()) b->stopper.add(word);
         }
 
-        // libzim builds the temp DB with DB_NO_TERMLIST and relies on
-        // compact() to rebuild termlists in the final glass DB. With
-        // xapian-core 2.0 that path produces a final DB without
-        // termlists, so we keep the termlist in the temp DB; compact
-        // then preserves it. Output matches canonical kiwix output
-        // (which has termlists for every doc).
-        b->db = Xapian::WritableDatabase(
-            b->tmp_path,
-            Xapian::DB_CREATE_OR_OVERWRITE);
+        // libzim sets DB_NO_TERMLIST so the final compacted DB has no
+        // per-doc termlists — current kiwix ZIMs match this. We expose
+        // a knob in case a caller needs termlists for tooling. The
+        // pre-2024 canonical we initially tested against happened to
+        // have termlists due to older Xapian compaction behaviour;
+        // do not be misled by that.
+        unsigned int flags = Xapian::DB_CREATE_OR_OVERWRITE;
+        if (!keep_termlists) flags |= Xapian::DB_NO_TERMLIST;
+        b->db = Xapian::WritableDatabase(b->tmp_path, flags);
 
         if (mode == 0) {
             b->db.set_metadata("valuesmap", "title:0;targetPath:1");
