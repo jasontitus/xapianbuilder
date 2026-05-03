@@ -107,10 +107,6 @@ icu::Transliterator* get_default_translit() {
     return t.get();
 }
 
-std::string remove_accents_lower(const std::string& s) {
-    return remove_accents_lower_with(get_default_translit(), s);
-}
-
 // ASCII-whitespace word counter (mirrors libzim's countWords).
 uint32_t count_words(const std::string& s) {
     uint32_t n = 0;
