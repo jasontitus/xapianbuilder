@@ -12,6 +12,11 @@ pub struct XbParsedDoc {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct XbDoc {
+    _private: [u8; 0],
+}
+
 unsafe extern "C" {
     pub fn xb_builder_new(
         tmp_path: *const c_char,
@@ -28,27 +33,31 @@ unsafe extern "C" {
 
     pub fn xb_builder_is_empty(b: *const XbBuilder) -> c_int;
 
-    pub fn xb_add_title(
-        b: *mut XbBuilder,
+    pub fn xb_prepare_title(
+        b: *const XbBuilder,
         path: *const c_char,
         title: *const c_char,
         target_path: *const c_char,
         lang_override: *const c_char,
-    ) -> c_int;
+    ) -> *mut XbDoc;
 
-    pub fn xb_add_fulltext(
-        b: *mut XbBuilder,
+    pub fn xb_prepare_fulltext(
+        b: *const XbBuilder,
         path: *const c_char,
         title: *const c_char,
         content: *const c_char,
         content_len: usize,
         keywords: *const c_char,
+        keywords_len: usize,
         word_count: c_uint,
         has_geo: c_int,
         latitude: c_double,
         longitude: c_double,
         lang_override: *const c_char,
-    ) -> c_int;
+    ) -> *mut XbDoc;
+
+    pub fn xb_add_doc(b: *mut XbBuilder, d: *const XbDoc) -> c_int;
+    pub fn xb_doc_free(d: *mut XbDoc);
 
     pub fn xb_finalize(b: *mut XbBuilder) -> c_int;
 

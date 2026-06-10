@@ -16,6 +16,7 @@
 
 #include "myhtmlparse.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <map>
@@ -99,12 +100,20 @@ std::string remove_accents_lower_with(icu::Transliterator* t, const std::string&
     return out;
 }
 
-// Default-rule accessor used by paths that pre-date per-builder
-// configurability (e.g. parse_html). They get the libzim rule, which
-// is the safest "match what kiwix does" default.
-icu::Transliterator* get_default_translit() {
-    static std::unique_ptr<icu::Transliterator> t(build_translit("libzim"));
-    return t.get();
+// Per-thread transliterator cache. ICU Transliterator instances are
+// not documented as safe for concurrent transliterate() calls (libzim
+// shares one static instance across its worker threads, which happens
+// to work but is not guaranteed); each thread builds its own copies.
+icu::Transliterator* tl_translit(const std::string& rule) {
+    thread_local std::map<std::string, std::unique_ptr<icu::Transliterator>>
+        cache;
+    auto it = cache.find(rule);
+    if (it == cache.end()) {
+        it = cache.emplace(rule, std::unique_ptr<icu::Transliterator>(
+                                     build_translit(rule)))
+                 .first;
+    }
+    return it->second.get();
 }
 
 // ASCII-whitespace word counter (mirrors libzim's countWords).
@@ -146,6 +155,14 @@ size_t size_of_indexed_text(const Xapian::Document& d) {
 
 // ---- IndexBuilder ------------------------------------------------------
 
+// Prepared Xapian document, built entirely in a worker thread and
+// handed to xb_add_doc on the writer thread. Xapian's refcounting is
+// not atomic, so a doc must only be touched by one thread at a time —
+// the prepare/add handoff satisfies that.
+struct XbDoc {
+    Xapian::Document doc;
+};
+
 struct XbBuilder {
     Xapian::WritableDatabase db;
     std::string tmp_path;
@@ -155,15 +172,8 @@ struct XbBuilder {
     std::string accent_rule;       // "libzim" | "latin"
     Xapian::SimpleStopper stopper; // populated from stopwords text
     int mode;                      // 0=title, 1=fulltext
-    bool empty = true;
+    std::atomic<bool> empty{true};
     std::mutex db_mu;              // matches libzim's s_dbaccessLock
-    // Per-language stemmer cache. Built lazily; reads + insertions
-    // are mutex-protected.
-    std::map<std::string, Xapian::Stem> stem_cache;
-    // Owned transliterator for the chosen accent rule. The default
-    // rule's transliterator comes from get_default_translit();
-    // builders that pick "latin" hold their own copy.
-    std::unique_ptr<icu::Transliterator> translit;
 };
 
 extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
@@ -190,9 +200,6 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
         }
         const std::string rule = accent_rule ? accent_rule : "libzim";
         b->accent_rule = (rule == "latin") ? "latin" : "libzim";
-        if (b->accent_rule == "latin") {
-            b->translit.reset(build_translit("latin"));
-        }
         b->mode = mode;
 
         // Populate stopper from newline-separated stopwords text.
@@ -209,7 +216,14 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
         // pre-2024 canonical we initially tested against happened to
         // have termlists due to older Xapian compaction behaviour;
         // do not be misled by that.
-        unsigned int flags = Xapian::DB_CREATE_OR_OVERWRITE;
+        // DB_NO_SYNC + DB_DANGEROUS: the tmp database is scratch space
+        // that is deleted on any failure and fully rewritten by
+        // compact() on success, so fsync-on-commit and copy-on-write
+        // crash safety buy nothing here. Skipping them speeds up
+        // commits substantially; the compacted output is byte-for-byte
+        // unaffected.
+        unsigned int flags = Xapian::DB_CREATE_OR_OVERWRITE |
+                             Xapian::DB_NO_SYNC | Xapian::DB_DANGEROUS;
         if (!keep_termlists) flags |= Xapian::DB_NO_TERMLIST;
         b->db = Xapian::WritableDatabase(b->tmp_path, flags);
 
@@ -242,13 +256,13 @@ extern "C" int xb_builder_is_empty(const XbBuilder* b) {
 }
 
 // Resolve the stemmer string for a per-doc invocation: explicit
-// override wins, otherwise fall back to the builder default. Cache
-// the resulting Stem objects (creation isn't free for every call).
-//
-// Caller must hold `b->db_mu` while calling — we reuse the same mutex
-// to keep the cache map racing-free without introducing a second
-// lock.
-static const Xapian::Stem* resolve_stem(XbBuilder* b, const char* lang_override) {
+// override wins, otherwise fall back to the builder default. The
+// cache is thread-local so prepare calls never contend on a lock and
+// never share a (non-atomically refcounted) Xapian::Stem across
+// threads. Failed lookups are cached as null so unknown languages
+// don't pay the exception cost on every document.
+static const Xapian::Stem* resolve_stem(const XbBuilder* b,
+                                        const char* lang_override) {
     std::string key;
     const std::string ovr = lang_override ? lang_override : "";
     if (ovr == "none") {
@@ -264,39 +278,35 @@ static const Xapian::Stem* resolve_stem(XbBuilder* b, const char* lang_override)
     }
     if (key.empty()) return nullptr;
 
-    auto it = b->stem_cache.find(key);
-    if (it != b->stem_cache.end()) return &it->second;
+    thread_local std::map<std::string, std::unique_ptr<Xapian::Stem>> cache;
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second.get();
 
+    std::unique_ptr<Xapian::Stem> stem;
     // Try literal first.
     try {
-        auto [iter, _] = b->stem_cache.emplace(key, Xapian::Stem(key));
-        return &iter->second;
-    } catch (...) {}
-
-    // Fall back to ICU language-code resolution (handles "eng" -> "en").
-    std::string resolved = stemmer_lang_for(key);
-    if (!resolved.empty() && resolved != key) {
-        try {
-            auto [iter, _] = b->stem_cache.emplace(key, Xapian::Stem(resolved));
-            return &iter->second;
-        } catch (...) {}
+        stem.reset(new Xapian::Stem(key));
+    } catch (...) {
+        // Fall back to ICU language-code resolution ("eng" -> "en").
+        std::string resolved = stemmer_lang_for(key);
+        if (!resolved.empty() && resolved != key) {
+            try {
+                stem.reset(new Xapian::Stem(resolved));
+            } catch (...) {}
+        }
     }
-    // Cache the failure as an empty Stem-less entry so we don't
-    // reattempt construction on every call. We do this by NOT
-    // inserting; lookups for the same key will retry. That's a
-    // minor inefficiency but keeps the map's invariant simple
-    // (every entry is a valid stemmer).
-    return nullptr;
+    it = cache.emplace(key, std::move(stem)).first;
+    return it->second.get();
 }
 
-extern "C" int xb_add_title(XbBuilder* b,
-                            const char* path,
-                            const char* title,
-                            const char* target_path,
-                            const char* lang_override) {
+extern "C" XbDoc* xb_prepare_title(const XbBuilder* b,
+                                   const char* path,
+                                   const char* title,
+                                   const char* target_path,
+                                   const char* lang_override) {
     if (!b || b->mode != 0) {
-        set_error("xb_add_title: builder is not in title mode");
-        return -1;
+        set_error("xb_prepare_title: builder is not in title mode");
+        return nullptr;
     }
     try {
         const std::string path_s = path ? path : "";
@@ -306,8 +316,6 @@ extern "C" int xb_add_title(XbBuilder* b,
         Xapian::TermGenerator indexer;
         indexer.set_max_word_length(MAX_INDEXABLE_TITLE_WORD_SIZE);
         indexer.set_flags(Xapian::TermGenerator::FLAG_CJK_NGRAM);
-        // Stemmer resolution touches b->stem_cache, guarded by db_mu.
-        std::lock_guard<std::mutex> lock(b->db_mu);
         const Xapian::Stem* s = resolve_stem(b, lang_override);
         if (s) {
             indexer.set_stemmer(*s);
@@ -315,13 +323,14 @@ extern "C" int xb_add_title(XbBuilder* b,
                 Xapian::TermGenerator::STEM_SOME);
         }
 
-        Xapian::Document doc;
+        auto out = std::unique_ptr<XbDoc>(new XbDoc);
+        Xapian::Document& doc = out->doc;
         std::string full_path = "C/" + path_s;
         doc.set_data(full_path);
         indexer.set_document(doc);
 
-        icu::Transliterator* t = b->translit ? b->translit.get() : get_default_translit();
-        std::string unaccented = remove_accents_lower_with(t, title_s);
+        std::string unaccented = remove_accents_lower_with(
+            tl_translit(b->accent_rule), title_s);
 
         doc.add_value(0, title_s);
         doc.add_value(1, target_s.empty() ? path_s : target_s);
@@ -332,7 +341,7 @@ extern "C" int xb_add_title(XbBuilder* b,
             if (anchored.size() >=
                 size_of_indexed_text(doc) + MAX_INDEXABLE_TITLE_WORD_SIZE) {
                 set_error("title indexing: too much data lost");
-                return -1;
+                return nullptr;
             }
             if (get_term_count(doc) == 1) {
                 // Only ANCHOR_TERM was added — title is solely
@@ -344,45 +353,48 @@ extern "C" int xb_add_title(XbBuilder* b,
                 }
             }
         }
-
-        // db_mu is already held above for stemmer resolution; reuse
-        // it for the actual add_document call.
-        b->db.add_document(doc);
-        b->empty = false;
-        return 0;
+        return out.release();
     } catch (const std::exception& e) {
-        set_error(std::string("xb_add_title: ") + e.what());
-        return -1;
+        set_error(std::string("xb_prepare_title: ") + e.what());
+        return nullptr;
     } catch (...) {
-        set_error("xb_add_title: unknown error");
-        return -1;
+        set_error("xb_prepare_title: unknown error");
+        return nullptr;
     }
 }
 
-extern "C" int xb_add_fulltext(XbBuilder* b,
-                               const char* path,
-                               const char* title,
-                               const char* content,
-                               size_t content_len,
-                               const char* keywords,
-                               uint32_t word_count,
-                               int has_geo,
-                               double latitude,
-                               double longitude,
-                               const char* lang_override) {
+extern "C" XbDoc* xb_prepare_fulltext(const XbBuilder* b,
+                                      const char* path,
+                                      const char* title,
+                                      const char* content,
+                                      size_t content_len,
+                                      const char* keywords,
+                                      size_t keywords_len,
+                                      uint32_t word_count,
+                                      int has_geo,
+                                      double latitude,
+                                      double longitude,
+                                      const char* lang_override) {
     if (!b || b->mode != 1) {
-        set_error("xb_add_fulltext: builder is not in fulltext mode");
-        return -1;
+        set_error("xb_prepare_fulltext: builder is not in fulltext mode");
+        return nullptr;
     }
     try {
         const std::string path_s = path ? path : "";
-        const std::string title_s = title ? title : "";
-        const std::string content_s = content ? std::string(content, content_len) : "";
-        const std::string keywords_s = keywords ? keywords : "";
+        const std::string title_raw = title ? title : "";
+        const std::string content_s =
+            content ? std::string(content, content_len) : "";
+        const std::string keywords_s =
+            keywords ? std::string(keywords, keywords_len) : "";
+
+        // libzim's DefaultIndexData stores removeAccents(title) and
+        // feeds the same string to the term generator; mirror that
+        // here (value 0 is only used for collapsing, never display).
+        const std::string title_s = remove_accents_lower_with(
+            tl_translit(b->accent_rule), title_raw);
 
         Xapian::TermGenerator indexer;
         indexer.set_flags(Xapian::TermGenerator::FLAG_CJK_NGRAM);
-        std::lock_guard<std::mutex> lock(b->db_mu);
         const Xapian::Stem* s = resolve_stem(b, lang_override);
         if (s) {
             indexer.set_stemmer(*s);
@@ -392,16 +404,13 @@ extern "C" int xb_add_fulltext(XbBuilder* b,
         indexer.set_stopper(&b->stopper);
         indexer.set_stopper_strategy(Xapian::TermGenerator::STOP_ALL);
 
-        Xapian::Document doc;
+        auto out = std::unique_ptr<XbDoc>(new XbDoc);
+        Xapian::Document& doc = out->doc;
         indexer.set_document(doc);
         std::string full_path = "C/" + path_s;
         doc.set_data(full_path);
         doc.add_value(0, title_s);
-        {
-            std::ostringstream os;
-            os << word_count;
-            doc.add_value(1, os.str());
-        }
+        doc.add_value(1, std::to_string(word_count));
         if (has_geo) {
             std::string geo =
                 Xapian::LatLongCoord(latitude, longitude).serialise();
@@ -418,18 +427,36 @@ extern "C" int xb_add_fulltext(XbBuilder* b,
         if (!keywords_s.empty())
             indexer.index_text_without_positions(keywords_s, 3);
 
-        // db_mu already held above for stemmer resolution.
-        b->db.add_document(doc);
-        b->empty = false;
+        return out.release();
+    } catch (const std::exception& e) {
+        set_error(std::string("xb_prepare_fulltext: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("xb_prepare_fulltext: unknown error");
+        return nullptr;
+    }
+}
+
+extern "C" int xb_add_doc(XbBuilder* b, const XbDoc* d) {
+    if (!b || !d) {
+        set_error("xb_add_doc: null builder or doc");
+        return -1;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(b->db_mu);
+        b->db.add_document(d->doc);
+        b->empty.store(false, std::memory_order_relaxed);
         return 0;
     } catch (const std::exception& e) {
-        set_error(std::string("xb_add_fulltext: ") + e.what());
+        set_error(std::string("xb_add_doc: ") + e.what());
         return -1;
     } catch (...) {
-        set_error("xb_add_fulltext: unknown error");
+        set_error("xb_add_doc: unknown error");
         return -1;
     }
 }
+
+extern "C" void xb_doc_free(XbDoc* d) { delete d; }
 
 extern "C" int xb_finalize(XbBuilder* b) {
     if (!b) return -1;
@@ -461,16 +488,6 @@ struct XbParsedDoc {
     double longitude;
 };
 
-// Cached transliterator for `xb_parse_html`. The libzim default is
-// reused across calls; the latin rule is built once on first use.
-icu::Transliterator* get_translit_for_rule(const std::string& rule) {
-    if (rule == "latin") {
-        static std::unique_ptr<icu::Transliterator> t(build_translit("latin"));
-        return t.get();
-    }
-    return get_default_translit();
-}
-
 extern "C" XbParsedDoc* xb_parse_html(const char* html, size_t len, const char* accent_rule) {
     try {
         zim::MyHtmlParser parser;
@@ -490,8 +507,11 @@ extern "C" XbParsedDoc* xb_parse_html(const char* html, size_t len, const char* 
         p->has_geo = parser.has_geoPosition;
         p->latitude = parser.latitude;
         p->longitude = parser.longitude;
-        const std::string rule = accent_rule ? accent_rule : "";
-        icu::Transliterator* t = get_translit_for_rule(rule);
+        const std::string rule =
+            (accent_rule && std::strcmp(accent_rule, "latin") == 0)
+                ? "latin"
+                : "libzim";
+        icu::Transliterator* t = tl_translit(rule);
         p->content = remove_accents_lower_with(t, parser.dump);
         p->keywords = remove_accents_lower_with(t, parser.keywords);
         return p;

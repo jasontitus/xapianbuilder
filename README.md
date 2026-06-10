@@ -60,13 +60,16 @@ Verified against the on-disk format produced by current libzim
 
 - `kind=fulltext`, `valuesmap=title:0;wordcount:1;geo.position:2`.
 - Positions OFF.
-- `value 0` = title, `value 1` = wordcount as decimal string,
-  `value 2` = serialised `Xapian::LatLongCoord` if a `geo.position`
-  meta tag was present.
+- `value 0` = `removeAccents(title)` — lowercased + accent-stripped,
+  exactly like libzim's `DefaultIndexData` (the fulltext title value
+  is only used for collapsing, never display; the title DB stores the
+  original). `value 1` = wordcount as decimal string, `value 2` =
+  serialised `Xapian::LatLongCoord` if a `geo.position` meta tag was
+  present.
 - TermGenerator: `FLAG_CJK_NGRAM`, `STEM_ALL` (no Z prefix —
   stemmed terms replace originals), `STOP_ALL` stopper.
 - `index_text_without_positions(content, 1)`,
-  `index_text_without_positions(title, contentLength/500 + 1)`,
+  `index_text_without_positions(removeAccents(title), contentLength/500 + 1)`,
   `index_text_without_positions(keywords, 3)`.
 
 ---
@@ -104,10 +107,17 @@ Common options:
   --skip-if-empty           Don't write the output file if zero docs
                             were indexed (matches libzim).
   --jobs <N>                Worker thread count (0 = num_cpus, 1 =
-                            single-threaded). HTML parsing runs in
-                            parallel; database writes are serialised
-                            in input order so doc IDs stay stable
-                            regardless of --jobs.
+                            single-threaded). HTML parsing and term
+                            generation run in parallel; database
+                            writes are serialised in input order so
+                            doc IDs stay stable regardless of --jobs.
+  --flush-threshold <N>     Documents buffered between Xapian B-tree
+                            flushes (sets XAPIAN_FLUSH_THRESHOLD).
+                            Default 50000 (Xapian's own default is
+                            10000) — higher is faster for bulk builds
+                            at the cost of memory. Doesn't affect the
+                            output bytes; the file is fully rewritten
+                            by compaction either way.
   --keep-termlists          Store per-doc termlists. Off by default
                             (matches modern kiwix; libzim uses
                             DB_NO_TERMLIST).
@@ -148,17 +158,18 @@ JSON Lines, one document per line:
 
 - `path` — entry path inside the ZIM. Becomes the doc's data field as
   `"C/" + path`.
-- `title` — original title with accents preserved. Stored verbatim in
-  value slot 0; the term generator gets a lowercased+accent-stripped
-  copy.
+- `title` — original title with accents preserved. The title DB
+  stores it verbatim in value slot 0; the fulltext DB stores and
+  indexes the lowercased+accent-stripped form (libzim semantics —
+  don't pre-strip it yourself or it diverges from the title DB).
 - `mimetype` — `text/html` runs through libzim's `MyHtmlParser`
   (extracts dump, keywords from `<meta name="keywords">`, and
   `geo.position` if present, plus `indexing_allowed` / NOINDEX gating).
   Anything else: the body is indexed as plain text, no metadata
   extraction.
 - `body` — UTF-8 content. May be empty for title-only docs.
-- `language` (optional) — currently ignored; the CLI `--language` is
-  authoritative. The field is accepted so callers can ship it now.
+- `language` (optional) — per-document stemmer override; empty or
+  absent inherits the CLI `--language` default.
 - `target_path` (title mode only) — set on redirects so the title
   DB stores the redirect target in `value 1`.
 
@@ -294,6 +305,40 @@ zimru should:
 
 ---
 
+## Performance
+
+The pipeline is built to beat libzim's indexer on the same corpus
+while producing identical bytes:
+
+- **All per-document CPU work runs in parallel.** JSON decode, HTML
+  strip, ICU transliteration, tokenisation, stemming, and stopword
+  filtering all happen in rayon workers, producing finished
+  `Xapian::Document`s; only `add_document` is serialised (libzim
+  parallelises the term generation too, but caps its worker pool and
+  pays a task-queue round trip per document).
+- **Three pipeline stages overlap.** While workers chew on chunk *N*,
+  the main thread simultaneously writes chunk *N−1* into the database
+  and reads chunk *N+1* from the input — the writer and reader never
+  sit idle behind the parsers. Documents are committed strictly in
+  input order, so doc IDs are reproducible regardless of `--jobs`.
+- **The scratch database skips durability work libzim pays for.** The
+  `.tmp` WritableDatabase is opened with `DB_NO_SYNC | DB_DANGEROUS` —
+  it is deleted on any failure and fully rewritten by `compact()` on
+  success, so fsync-on-commit and copy-on-write crash safety buy
+  nothing. The compacted output is byte-for-byte unaffected.
+- **Bulk-tuned flush threshold.** `XAPIAN_FLUSH_THRESHOLD` defaults to
+  50000 docs (Xapian's default of 10000 is tuned for incremental
+  updates). Tune with `--flush-threshold`; lower it on small-memory
+  machines.
+
+On a 4-core container, a 20k-doc / 92 MB synthetic Wikipedia-style
+corpus builds in 5.2 s vs 10.1 s for the pre-pipeline design (which
+already parallelised HTML parsing); machines with more cores scale
+further since the serial leg is only `add_document`. Output verified
+byte-identical (modulo the random glass UUID at bytes 17–32).
+
+---
+
 ## License posture
 
 - **xapianbuilder is GPL-3-or-later.**
@@ -411,9 +456,6 @@ match.
   corpora at ~1 doc-position per few hundred (Hebrew points, Arabic
   harakat, and other non-Latin Mn marks libzim strips and we don't).
   Default stays `libzim` to preserve byte-compat.
-- **Per-doc language override unused.** The JSONL `language` field is
-  parsed but ignored — CLI `--language` wins. Wire this through if we
-  start seeing mixed-language ZIMs (`zh-Hant` + `en` etc.).
 - **One known doc-level divergence on Thai-language content.** When
   combining-mark stripping (`Lower; NFD; [:M:] remove; NFC` — same
   ICU rules libzim uses) hits Thai vowel signs (Mn class) but not

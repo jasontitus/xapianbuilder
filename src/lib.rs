@@ -56,13 +56,36 @@ pub struct Builder {
     finalized: bool,
 }
 
-// SAFETY: every method that touches `raw` either takes `&mut self` or
-// goes through a function the C++ side guards with its own mutex
-// (xb_add_*). The C ABI is therefore safe to use from multiple threads
-// holding shared references to the same builder; that's how the
-// parallel feeder in main.rs uses it.
+// SAFETY: every method that touches `raw` either takes `&mut self`,
+// only reads builder state that is immutable after construction
+// (xb_prepare_*), or goes through a function the C++ side guards with
+// its own mutex (xb_add_doc). The C ABI is therefore safe to use from
+// multiple threads holding shared references to the same builder;
+// that's how the parallel feeder in main.rs uses it.
 unsafe impl Send for Builder {}
 unsafe impl Sync for Builder {}
+
+/// A fully tokenised Xapian document, produced by
+/// [`Builder::prepare_title`] / [`Builder::prepare_fulltext`] (cheap
+/// to build concurrently) and consumed by [`Builder::add_doc`] (the
+/// serialised database write).
+pub struct PreparedDoc {
+    raw: *mut ffi::XbDoc,
+}
+
+// SAFETY: the underlying Xapian::Document is only ever touched by one
+// thread at a time (built in a worker, then handed to the writer);
+// transferring ownership across threads is fine.
+unsafe impl Send for PreparedDoc {}
+
+impl Drop for PreparedDoc {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { ffi::xb_doc_free(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
 
 impl Builder {
     /// `tmp_path` is the workspace where the WritableDatabase is written
@@ -119,25 +142,25 @@ impl Builder {
         unsafe { ffi::xb_builder_is_empty(self.raw) != 0 }
     }
 
-    /// Adds a title-DB document. Safe to call concurrently from
-    /// multiple threads — the C++ side serialises actual database
-    /// writes via an internal mutex.
+    /// Builds a title-DB document without touching the database. Runs
+    /// the full tokenise/stem pipeline, so it's the expensive half;
+    /// safe to call concurrently from multiple threads.
     ///
     /// `lang_override` (empty = inherit builder default) selects the
     /// per-doc Snowball stemmer; useful for multilingual ZIMs.
-    pub fn add_title(
+    pub fn prepare_title(
         &self,
         path: &str,
         title: &str,
         target_path: &str,
         lang_override: &str,
-    ) -> Result<()> {
+    ) -> Result<PreparedDoc> {
         let path_c = CString::new(path)?;
         let title_c = CString::new(title)?;
         let target_c = CString::new(target_path)?;
         let lang_c = CString::new(lang_override)?;
-        let rc = unsafe {
-            ffi::xb_add_title(
+        let raw = unsafe {
+            ffi::xb_prepare_title(
                 self.raw,
                 path_c.as_ptr(),
                 title_c.as_ptr(),
@@ -145,13 +168,80 @@ impl Builder {
                 lang_c.as_ptr(),
             )
         };
+        if raw.is_null() {
+            return Err(anyhow!("xb_prepare_title({path}): {}", last_error()));
+        }
+        Ok(PreparedDoc { raw })
+    }
+
+    /// Builds a fulltext-DB document without touching the database.
+    /// Concurrent-safe like `prepare_title`. `content`/`keywords` are
+    /// expected pre-processed (lowercased + accent-stripped, as
+    /// produced by [`parse::ParsedDoc`]); `title` is raw — the
+    /// builder's accent rule is applied to it internally, matching
+    /// libzim.
+    pub fn prepare_fulltext(
+        &self,
+        path: &str,
+        title: &str,
+        content: &[u8],
+        keywords: &[u8],
+        word_count: u32,
+        geo: Option<(f64, f64)>,
+        lang_override: &str,
+    ) -> Result<PreparedDoc> {
+        let path_c = CString::new(path)?;
+        let title_c = CString::new(title)?;
+        let lang_c = CString::new(lang_override)?;
+        let (has_geo, lat, lng) = match geo {
+            Some((lat, lng)) => (1, lat, lng),
+            None => (0, 0.0, 0.0),
+        };
+        let raw = unsafe {
+            ffi::xb_prepare_fulltext(
+                self.raw,
+                path_c.as_ptr(),
+                title_c.as_ptr(),
+                content.as_ptr() as *const _,
+                content.len(),
+                keywords.as_ptr() as *const _,
+                keywords.len(),
+                word_count,
+                has_geo,
+                lat,
+                lng,
+                lang_c.as_ptr(),
+            )
+        };
+        if raw.is_null() {
+            return Err(anyhow!("xb_prepare_fulltext({path}): {}", last_error()));
+        }
+        Ok(PreparedDoc { raw })
+    }
+
+    /// Appends a prepared document to the database. Doc IDs are
+    /// assigned in call order; the write is serialised by a mutex on
+    /// the C++ side (matching libzim's `s_dbaccessLock`).
+    pub fn add_doc(&self, doc: &PreparedDoc) -> Result<()> {
+        let rc = unsafe { ffi::xb_add_doc(self.raw, doc.raw) };
         if rc != 0 {
-            return Err(anyhow!("xb_add_title({path}): {}", last_error()));
+            return Err(anyhow!("xb_add_doc: {}", last_error()));
         }
         Ok(())
     }
 
-    /// Adds a fulltext-DB document. Concurrent-safe like `add_title`.
+    /// Convenience: prepare + add in one call.
+    pub fn add_title(
+        &self,
+        path: &str,
+        title: &str,
+        target_path: &str,
+        lang_override: &str,
+    ) -> Result<()> {
+        self.add_doc(&self.prepare_title(path, title, target_path, lang_override)?)
+    }
+
+    /// Convenience: prepare + add in one call.
     pub fn add_fulltext(
         &self,
         path: &str,
@@ -162,40 +252,15 @@ impl Builder {
         geo: Option<(f64, f64)>,
         lang_override: &str,
     ) -> Result<()> {
-        let path_c = CString::new(path)?;
-        let title_c = CString::new(title)?;
-        let keywords_c = CString::new(keywords)?;
-        let lang_c = CString::new(lang_override)?;
-        // Content may contain interior NULs in pathological inputs; we
-        // strip them so CString creation succeeds.
-        let content_c = if content.contains('\0') {
-            CString::new(content.replace('\0', " "))?
-        } else {
-            CString::new(content)?
-        };
-        let (has_geo, lat, lng) = match geo {
-            Some((lat, lng)) => (1, lat, lng),
-            None => (0, 0.0, 0.0),
-        };
-        let rc = unsafe {
-            ffi::xb_add_fulltext(
-                self.raw,
-                path_c.as_ptr(),
-                title_c.as_ptr(),
-                content_c.as_ptr(),
-                content.len(),
-                keywords_c.as_ptr(),
-                word_count,
-                has_geo,
-                lat,
-                lng,
-                lang_c.as_ptr(),
-            )
-        };
-        if rc != 0 {
-            return Err(anyhow!("xb_add_fulltext({path}): {}", last_error()));
-        }
-        Ok(())
+        self.add_doc(&self.prepare_fulltext(
+            path,
+            title,
+            content.as_bytes(),
+            keywords.as_bytes(),
+            word_count,
+            geo,
+            lang_override,
+        )?)
     }
 
     pub fn finalize(mut self) -> Result<()> {
