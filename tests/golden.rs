@@ -119,13 +119,13 @@ fn skip_if_empty_omits_file() {
 fn per_doc_language_overrides_cli() {
     // Two docs, same body content; one tagged "porter" (Porter1) and
     // one tagged "english" (Porter2). The resulting term lists must
-    // differ — Porter1 stems "international" -> "intern", Porter2
-    // -> "internat".
+    // differ — "dying" is on Porter2's special exception list
+    // (-> "die") while Porter1 just strips the suffix (-> "dy").
     let dir = workdir("per_doc_lang");
     let input = dir.join("mixed.jsonl");
     std::fs::write(&input,
-        "{\"path\":\"a\",\"title\":\"A\",\"mimetype\":\"text/html\",\"language\":\"porter\",\"body\":\"<html><body>international universities are good</body></html>\"}\n\
-         {\"path\":\"b\",\"title\":\"B\",\"mimetype\":\"text/html\",\"language\":\"english\",\"body\":\"<html><body>international universities are good</body></html>\"}\n",
+        "{\"path\":\"a\",\"title\":\"A\",\"mimetype\":\"text/html\",\"language\":\"porter\",\"body\":\"<html><body>dying universities</body></html>\"}\n\
+         {\"path\":\"b\",\"title\":\"B\",\"mimetype\":\"text/html\",\"language\":\"english\",\"body\":\"<html><body>dying universities</body></html>\"}\n",
     ).unwrap();
     let out = dir.join("mixed.xapian");
     let status = Command::new(bin())
@@ -146,10 +146,42 @@ fn per_doc_language_overrides_cli() {
     };
     let porter1 = terms_for("1");
     let porter2 = terms_for("2");
-    // Porter1 stems "international" -> "intern", "universities" -> "univers".
-    // Porter2 leaves "international" -> "internat", "universities" -> "universiti".
-    assert!(porter1.contains("intern"), "doc1 (porter): expected 'intern' stem; got {porter1}");
-    assert!(porter2.contains("internat"), "doc2 (english): expected 'internat' stem; got {porter2}");
+    assert!(porter1.contains("dy") && !porter1.contains("die"),
+        "doc1 (porter): expected 'dy' stem; got {porter1}");
+    assert!(porter2.contains("die"),
+        "doc2 (english): expected 'die' stem; got {porter2}");
+}
+
+#[test]
+fn fulltext_title_is_unaccented_like_libzim() {
+    // libzim's DefaultIndexData runs removeAccents() (lowercase + NFD
+    // + strip marks + NFC) over the title and uses the result for BOTH
+    // value slot 0 and the indexed title terms. "Café Été" must land
+    // as value "cafe ete" and produce the term "cafe", not "café".
+    let dir = workdir("fulltext_title_accents");
+    let input = dir.join("accents.jsonl");
+    std::fs::write(&input,
+        "{\"path\":\"a\",\"title\":\"Café Été\",\"mimetype\":\"text/html\",\"body\":\"<html><body>body text here</body></html>\"}\n",
+    ).unwrap();
+    let out = dir.join("accents.xapian");
+    let status = Command::new(bin())
+        .args(["fulltext", "--input"]).arg(&input)
+        .args(["--output"]).arg(&out)
+        .args(["--language", "eng", "--keep-termlists", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    if !xapian_delve_available() { return; }
+    let listing = String::from_utf8_lossy(
+        &Command::new("xapian-delve")
+            .args(["-1", "-d", "-V", "-r", "1"]).arg(&out)
+            .output().unwrap().stdout
+    ).into_owned();
+    assert!(listing.contains("cafe ete"),
+        "value 0 should be the unaccented lowercased title:\n{listing}");
+    assert!(!listing.contains("café"),
+        "no accented title terms should remain:\n{listing}");
 }
 
 #[test]

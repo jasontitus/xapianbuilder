@@ -15,6 +15,7 @@ extern "C" {
 
 typedef struct XbBuilder XbBuilder;
 typedef struct XbParsedDoc XbParsedDoc;
+typedef struct XbDoc XbDoc;
 
 // Mode: 0 = title DB, 1 = fulltext DB.
 //
@@ -51,31 +52,44 @@ void xb_builder_free(XbBuilder*);
 // flag — used by callers to suppress emitting an empty index file).
 int xb_builder_is_empty(const XbBuilder*);
 
-// All add_* and finalize return 0 on success, nonzero on error
-// (call xb_last_error() for a message).
-
+// Document preparation runs the full TermGenerator pipeline
+// (tokenisation, stemming, stopwords) WITHOUT touching the database,
+// so it is safe to call concurrently from many threads — this mirrors
+// libzim's xapianWorker design where only add_document is serialised.
+// Returns NULL on error (call xb_last_error() for a message).
+//
 // `lang_override` (may be NULL or "") forwards to `Xapian::Stem`
 // for this single document, overriding the builder-level language.
 // Useful for multilingual ZIMs where per-entry language is known.
-int xb_add_title(XbBuilder*,
-                 const char* path,
-                 const char* title,
-                 const char* target_path /* "" if not redirect */,
-                 const char* lang_override);
+XbDoc* xb_prepare_title(const XbBuilder*,
+                        const char* path,
+                        const char* title,
+                        const char* target_path /* "" if not redirect */,
+                        const char* lang_override);
 
 // content/keywords are expected pre-processed (lowercased + accents
 // stripped) by the caller (parse_html does this for HTML inputs).
-int xb_add_fulltext(XbBuilder*,
-                    const char* path,
-                    const char* title,
-                    const char* content,
-                    size_t content_len,
-                    const char* keywords,
-                    uint32_t word_count,
-                    int has_geo,
-                    double latitude,
-                    double longitude,
-                    const char* lang_override);
+// `title` is raw — the builder's accent rule is applied internally
+// before it is stored in value 0 and indexed (matches libzim's
+// DefaultIndexData, which feeds removeAccents(title) to both).
+XbDoc* xb_prepare_fulltext(const XbBuilder*,
+                           const char* path,
+                           const char* title,
+                           const char* content,
+                           size_t content_len,
+                           const char* keywords,
+                           size_t keywords_len,
+                           uint32_t word_count,
+                           int has_geo,
+                           double latitude,
+                           double longitude,
+                           const char* lang_override);
+
+// Appends a prepared document to the database (doc IDs are assigned
+// in call order). Serialised internally with a mutex; the doc is NOT
+// freed — call xb_doc_free afterwards. Returns 0 on success.
+int xb_add_doc(XbBuilder*, const XbDoc*);
+void xb_doc_free(XbDoc*);
 
 int xb_finalize(XbBuilder*);
 

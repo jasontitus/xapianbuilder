@@ -1,7 +1,7 @@
 //! `xapianbuilder` — CLI for building kiwix-compatible Xapian indexes.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, stdin};
+use std::io::{BufRead, BufReader, Lines, Read, stdin};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use xapianbuilder::{AccentRule, Builder, Mode, parse::ParsedDoc, stopwords};
+use xapianbuilder::{AccentRule, Builder, Mode, PreparedDoc, parse::ParsedDoc, stopwords};
 
 /// Parallel-pipeline chunk size — the JSONL reader buffers up to
 /// CHUNK lines, then dispatches them across worker threads. Larger
@@ -17,6 +17,14 @@ use xapianbuilder::{AccentRule, Builder, Mode, parse::ParsedDoc, stopwords};
 /// memory use bounded for big bodies. 256 is a reasonable default for
 /// Wikipedia-sized articles (~50 KB each → ~12 MB peak per chunk).
 const CHUNK: usize = 256;
+
+/// Default value for `XAPIAN_FLUSH_THRESHOLD` (docs buffered in
+/// memory between glass B-tree flushes) when neither `--flush-threshold`
+/// nor the environment variable is set. Xapian's built-in default of
+/// 10000 is tuned for incremental updates; bulk index builds go
+/// noticeably faster with fewer, larger flushes. ~50k Wikipedia-sized
+/// docs buffer a few hundred MB of postings.
+const DEFAULT_FLUSH_THRESHOLD: &str = "50000";
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Build kiwix-compatible Xapian indexes")]
@@ -76,9 +84,9 @@ struct BuildArgs {
     #[arg(long)]
     skip_if_empty: bool,
     /// Worker thread count. 0 (default) = num_cpus. 1 = strictly
-    /// single-threaded. The HTML parser runs per-thread; database
-    /// writes are serialised by an internal mutex inside the C++
-    /// bridge, matching libzim's `s_dbaccessLock` design.
+    /// single-threaded. HTML parsing and term generation run in
+    /// parallel; database writes are serialised in input order so doc
+    /// IDs stay stable regardless of --jobs.
     #[arg(long, default_value_t = 0)]
     jobs: usize,
     /// Store per-doc termlists in the output DB. Default off — matches
@@ -96,6 +104,15 @@ struct BuildArgs {
     /// on those corpora.
     #[arg(long, value_parser = ["libzim", "latin"], default_value = "libzim")]
     accent_rule: String,
+    /// Documents buffered in memory between Xapian B-tree flushes
+    /// (sets XAPIAN_FLUSH_THRESHOLD). Higher = faster bulk builds,
+    /// more memory. Defaults to 50000 (Xapian's own default is 10000);
+    /// an already-set XAPIAN_FLUSH_THRESHOLD env var wins over the
+    /// default but loses to an explicit flag. Has no effect on the
+    /// final file's bytes — the output is fully rewritten by
+    /// compaction either way.
+    #[arg(long)]
+    flush_threshold: Option<u32>,
     /// Suppress progress output.
     #[arg(long)]
     quiet: bool,
@@ -145,6 +162,18 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    // Xapian reads XAPIAN_FLUSH_THRESHOLD when the WritableDatabase is
+    // created, so this must happen before Builder::new. We're still
+    // single-threaded here (the rayon pool spins up lazily later).
+    match args.flush_threshold {
+        Some(n) => std::env::set_var("XAPIAN_FLUSH_THRESHOLD", n.to_string()),
+        None => {
+            if std::env::var_os("XAPIAN_FLUSH_THRESHOLD").is_none() {
+                std::env::set_var("XAPIAN_FLUSH_THRESHOLD", DEFAULT_FLUSH_THRESHOLD);
+            }
+        }
+    }
+
     let stopwords_owned;
     let stopwords_text: &str = if let Some(p) = &args.stopwords_file {
         stopwords_owned = std::fs::read_to_string(p)
@@ -177,72 +206,50 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
             .ok(); // already initialised on a second invocation; harmless.
     }
 
-    let reader: Box<dyn Read> = if args.input == "-" {
-        Box::new(stdin().lock())
+    // `Send` because the reader crosses into rayon::join; Stdin locks
+    // per call, which the 1 MB BufReader amortises away.
+    let reader: Box<dyn Read + Send> = if args.input == "-" {
+        Box::new(stdin())
     } else {
         Box::new(File::open(&args.input).with_context(|| {
             format!("opening input {}", &args.input)
         })?)
     };
-    let reader = BufReader::with_capacity(1 << 20, reader);
+    let mut lines = BufReader::with_capacity(1 << 20, reader).lines();
 
-    let mut chunk: Vec<String> = Vec::with_capacity(CHUNK);
+    // Three-stage pipeline, two chunks in flight:
+    //   1. read JSONL lines (serial, cheap),
+    //   2. parse + tokenise into Xapian documents (rayon workers — the
+    //      expensive part: HTML strip, ICU transliteration, stemming),
+    //   3. add_document in input order (serial, keeps doc IDs stable).
+    // Each loop turn overlaps stage 2 for chunk N with stages 3+1 for
+    // chunks N-1 / N+1 via rayon::join, so the writer and the reader
+    // never sit idle behind the parsers.
     let mut count: u64 = 0;
-    let flush = |chunk: &mut Vec<String>, count: &mut u64| -> Result<()> {
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        // Parse in parallel — `par_iter().collect()` preserves input
-        // order — then add to the DB serially. Doc IDs in Xapian are
-        // assigned in `add_document` call order, so this keeps them
-        // stable regardless of `--jobs`. The expensive work (HTML
-        // strip, ICU lower+strip accents, word count) happens in the
-        // workers; the serial leg only does a couple of CString
-        // copies and the actual Xapian write.
-        let prepared: Vec<Result<Prepared>> = match mode {
-            Mode::Fulltext => chunk
-                .par_iter()
-                .map(|line| prepare_fulltext(line, accent_rule))
-                .collect(),
-            Mode::Title => chunk
-                .par_iter()
-                .map(|line| prepare_title(line))
-                .collect(),
-        };
-        for res in prepared {
-            match res? {
-                Prepared::Skip => continue,
-                Prepared::Title { path, title, target_path, lang } => {
-                    builder.add_title(&path, &title, &target_path, &lang)?;
+    let mut last_report: u64 = 0;
+    let mut cur = read_chunk(&mut lines)?;
+    let mut pending: Option<Vec<Prepared>> = None;
+    while !cur.is_empty() {
+        let (io_res, prep_res) = rayon::join(
+            || -> Result<Vec<String>> {
+                if let Some(docs) = pending.take() {
+                    write_docs(&builder, docs, &mut count)?;
                 }
-                Prepared::Fulltext {
-                    path, title, content, keywords, word_count, geo, lang,
-                } => {
-                    builder.add_fulltext(
-                        &path, &title, &content, &keywords, word_count, geo, &lang,
-                    )?;
-                }
-            }
-        }
-        *count += chunk.len() as u64;
-        chunk.clear();
-        Ok(())
-    };
-
-    for line in reader.lines() {
-        let line = line.context("reading input")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        chunk.push(line);
-        if chunk.len() >= CHUNK {
-            flush(&mut chunk, &mut count)?;
-            if !args.quiet && count.is_multiple_of(1000) {
-                eprintln!("{count} docs indexed");
-            }
+                read_chunk(&mut lines)
+            },
+            || prepare_chunk(&builder, mode, &cur, accent_rule),
+        );
+        let next = io_res?;
+        pending = Some(prep_res?);
+        cur = next;
+        if !args.quiet && count - last_report >= 1000 {
+            eprintln!("{count} docs indexed");
+            last_report = count;
         }
     }
-    flush(&mut chunk, &mut count)?;
+    if let Some(docs) = pending.take() {
+        write_docs(&builder, docs, &mut count)?;
+    }
 
     if args.skip_if_empty && builder.is_empty() {
         if !args.quiet {
@@ -261,83 +268,114 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
     Ok(())
 }
 
-/// A document already parsed and ready to be handed to the Builder.
-/// Computed in worker threads, applied serially.
+/// Reads up to CHUNK non-empty lines. An empty result means EOF.
+fn read_chunk(lines: &mut Lines<BufReader<Box<dyn Read + Send>>>) -> Result<Vec<String>> {
+    let mut chunk = Vec::with_capacity(CHUNK);
+    for line in lines {
+        let line = line.context("reading input")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        chunk.push(line);
+        if chunk.len() >= CHUNK {
+            break;
+        }
+    }
+    Ok(chunk)
+}
+
+/// Parse + tokenise a chunk in parallel. `par_iter().collect()`
+/// preserves input order, so the documents come back in the same
+/// order the lines were read.
+fn prepare_chunk(
+    builder: &Builder,
+    mode: Mode,
+    chunk: &[String],
+    rule: AccentRule,
+) -> Result<Vec<Prepared>> {
+    match mode {
+        Mode::Fulltext => chunk
+            .par_iter()
+            .map(|line| prepare_fulltext(builder, line, rule))
+            .collect(),
+        Mode::Title => chunk
+            .par_iter()
+            .map(|line| prepare_title(builder, line))
+            .collect(),
+    }
+}
+
+/// Serial leg: append prepared documents in input order.
+fn write_docs(builder: &Builder, docs: Vec<Prepared>, count: &mut u64) -> Result<()> {
+    *count += docs.len() as u64;
+    for prepared in docs {
+        if let Prepared::Doc(doc) = prepared {
+            builder.add_doc(&doc)?;
+        }
+    }
+    Ok(())
+}
+
+/// A document already parsed + tokenised, ready for the serial
+/// add_document leg. Computed in worker threads, applied in order.
 enum Prepared {
     Skip,
-    Title {
-        path: String,
-        title: String,
-        target_path: String,
-        lang: String,
-    },
-    Fulltext {
-        path: String,
-        title: String,
-        content: String,
-        keywords: String,
-        word_count: u32,
-        geo: Option<(f64, f64)>,
-        lang: String,
-    },
+    Doc(PreparedDoc),
 }
 
-fn prepare_title(line: &str) -> Result<Prepared> {
-    let doc: InputDoc = serde_json::from_str(line)
-        .with_context(|| format!("parsing JSONL: {}", line.chars().take(80).collect::<String>()))?;
-    Ok(Prepared::Title {
-        path: doc.path,
-        title: doc.title,
-        target_path: doc.target_path.unwrap_or_default(),
-        lang: doc.language.unwrap_or_default(),
-    })
+fn parse_line(line: &str) -> Result<InputDoc> {
+    serde_json::from_str(line)
+        .with_context(|| format!("parsing JSONL: {}", line.chars().take(80).collect::<String>()))
 }
 
-fn prepare_fulltext(line: &str, rule: AccentRule) -> Result<Prepared> {
-    let doc: InputDoc = serde_json::from_str(line)
-        .with_context(|| format!("parsing JSONL: {}", line.chars().take(80).collect::<String>()))?;
+fn prepare_title(builder: &Builder, line: &str) -> Result<Prepared> {
+    let doc = parse_line(line)?;
+    let target_path = doc.target_path.unwrap_or_default();
+    let lang = doc.language.unwrap_or_default();
+    let prepared = builder.prepare_title(&doc.path, &doc.title, &target_path, &lang)?;
+    Ok(Prepared::Doc(prepared))
+}
 
-    let parsed = if doc.mimetype.starts_with("text/html") {
-        ParsedDoc::parse_with(doc.body.as_bytes(), rule)
-    } else {
-        None
-    };
+fn prepare_fulltext(builder: &Builder, line: &str, rule: AccentRule) -> Result<Prepared> {
+    let doc = parse_line(line)?;
+    let lang = doc.language.unwrap_or_default();
 
-    let (content, keywords, word_count, geo, indexable) = match &parsed {
-        Some(p) => (
-            p.content().to_string(),
-            p.keywords().to_string(),
-            p.word_count(),
-            p.geo(),
-            p.indexing_allowed(),
-        ),
-        None => {
-            // Non-HTML mimetypes pass through verbatim. libzim only
-            // runs MyHtmlParser, so anything else lands in the index
-            // unmodified — no accent strip, no keyword extraction.
-            let wc = doc.body.split_whitespace().count() as u32;
-            (
-                doc.body.clone(),
-                String::new(),
-                wc,
-                None,
-                !doc.body.is_empty(),
-            )
+    if doc.mimetype.starts_with("text/html") {
+        let parsed = ParsedDoc::parse_with(doc.body.as_bytes(), rule)
+            .with_context(|| format!("parsing HTML for {}", doc.path))?;
+        if !parsed.indexing_allowed() {
+            return Ok(Prepared::Skip);
         }
-    };
-
-    if !indexable {
-        return Ok(Prepared::Skip);
+        let prepared = builder.prepare_fulltext(
+            &doc.path,
+            &doc.title,
+            parsed.content().as_bytes(),
+            parsed.keywords().as_bytes(),
+            parsed.word_count(),
+            parsed.geo(),
+            &lang,
+        )?;
+        Ok(Prepared::Doc(prepared))
+    } else {
+        // Non-HTML mimetypes pass through verbatim. libzim only
+        // indexes HTML (everything else has no IndexData), so this is
+        // an extension: the body lands in the index unmodified — no
+        // accent strip, no keyword extraction.
+        if doc.body.is_empty() {
+            return Ok(Prepared::Skip);
+        }
+        let word_count = doc.body.split_whitespace().count() as u32;
+        let prepared = builder.prepare_fulltext(
+            &doc.path,
+            &doc.title,
+            doc.body.as_bytes(),
+            b"",
+            word_count,
+            None,
+            &lang,
+        )?;
+        Ok(Prepared::Doc(prepared))
     }
-    Ok(Prepared::Fulltext {
-        path: doc.path,
-        title: doc.title,
-        content,
-        keywords,
-        word_count,
-        geo,
-        lang: doc.language.unwrap_or_default(),
-    })
 }
 
 fn with_suffix(p: &PathBuf, suffix: &str) -> PathBuf {
