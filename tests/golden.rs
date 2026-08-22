@@ -54,7 +54,10 @@ fn fulltext_build_smoke() {
     assert!(out.exists(), "no output file");
     assert_eq!(read_magic(&out), GLASS_MAGIC);
     // Apollo_13 has robots=noindex, so it's skipped: 2 indexable docs.
-    let n = doc_count(&out);
+    let Some(n) = doc_count(&out) else {
+        eprintln!("xapian-delve not installed; skipping the document-count assertion");
+        return;
+    };
     assert_eq!(n, 2, "expected 2 indexable docs, got {n}");
 }
 
@@ -74,7 +77,11 @@ fn title_build_smoke() {
     assert_eq!(read_magic(&out), GLASS_MAGIC);
     // Title DB indexes everything regardless of NOINDEX (it's about
     // the entry, not the body) — all 3 docs are present.
-    assert_eq!(doc_count(&out), 3);
+    let Some(n) = doc_count(&out) else {
+        eprintln!("xapian-delve not installed; skipping the document-count assertion");
+        return;
+    };
+    assert_eq!(n, 3, "expected 3 title docs, got {n}");
 }
 
 #[test]
@@ -341,10 +348,18 @@ fn xapian_delve_available() -> bool {
         .unwrap_or(false)
 }
 
-fn doc_count(db: &PathBuf) -> u32 {
+/// Document count from `xapian-delve`, or `None` when the tool is not
+/// installed.
+///
+/// This used to return `1` as a stand-in when delve was missing, which made
+/// the assertions compare a real expectation against a fabricated number:
+/// tests expecting 2 or 3 documents *failed* on a machine without
+/// xapian-tools — the opposite of the documented "skip silently on minimal
+/// CI images" — and any test expecting exactly 1 would have passed without
+/// checking anything at all. Callers now skip explicitly and say so.
+fn doc_count(db: &PathBuf) -> Option<u32> {
     if !xapian_delve_available() {
-        // Fall back to magic check + assume nonzero.
-        return 1;
+        return None;
     }
     let out = Command::new("xapian-delve")
         .arg(db)
@@ -353,7 +368,7 @@ fn doc_count(db: &PathBuf) -> u32 {
     let s = String::from_utf8_lossy(&out.stdout);
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("number of documents = ") {
-            return rest.trim().parse().unwrap();
+            return Some(rest.trim().parse().unwrap());
         }
     }
     panic!("doc count not found in delve output:\n{s}");

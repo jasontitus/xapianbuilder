@@ -18,6 +18,11 @@ use xapianbuilder::{AccentRule, Builder, Mode, PreparedDoc, parse::ParsedDoc, st
 /// Wikipedia-sized articles (~50 KB each → ~12 MB peak per chunk).
 const CHUNK: usize = 256;
 
+/// Byte budget for one in-flight chunk. Paired with CHUNK so that a few
+/// very large entries cannot put an unbounded amount of content in flight;
+/// see [`read_chunk`].
+const CHUNK_BYTES: usize = 64 << 20;
+
 /// Default value for `XAPIAN_FLUSH_THRESHOLD` (docs buffered in
 /// memory between glass B-tree flushes) when neither `--flush-threshold`
 /// nor the environment variable is set. Xapian's built-in default of
@@ -268,16 +273,29 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
     Ok(())
 }
 
-/// Reads up to CHUNK non-empty lines. An empty result means EOF.
+/// Reads up to CHUNK non-empty lines, or CHUNK_BYTES of them, whichever
+/// comes first. An empty result means EOF.
+///
+/// The byte budget matters because a line is one whole ZIM entry: its body
+/// is an entire article. Bounding only the line count bounds the number of
+/// documents in flight but not their size, and with two chunks pipelined
+/// that is 512 unbounded bodies resident. An archive whose entries are
+/// large — a scraper that inlined its images as data: URIs, or a crafted
+/// one — then drives memory by content size rather than by anything this
+/// program chose. A single line larger than the budget is still read whole
+/// and processed alone, which is the best that can be done without
+/// refusing to index the entry at all.
 fn read_chunk(lines: &mut Lines<BufReader<Box<dyn Read + Send>>>) -> Result<Vec<String>> {
     let mut chunk = Vec::with_capacity(CHUNK);
+    let mut bytes = 0usize;
     for line in lines {
         let line = line.context("reading input")?;
         if line.trim().is_empty() {
             continue;
         }
+        bytes += line.len();
         chunk.push(line);
-        if chunk.len() >= CHUNK {
+        if chunk.len() >= CHUNK || bytes >= CHUNK_BYTES {
             break;
         }
     }
@@ -328,10 +346,30 @@ fn parse_line(line: &str) -> Result<InputDoc> {
         .with_context(|| format!("parsing JSONL: {}", line.chars().take(80).collect::<String>()))
 }
 
+/// True when any field that has to cross the C ABI as a NUL-terminated
+/// string contains an interior NUL.
+///
+/// Such an entry cannot be represented as a `CString`, and turning that into
+/// a hard error means one malformed entry costs the *whole archive* its
+/// index: the builder exits non-zero, writes no database, and zimru — which
+/// treats a failed helper as "carry on without indexes" — then ships a ZIM
+/// with no search at all. Skipping the single entry is the proportionate
+/// response.
+fn has_interior_nul(fields: &[&str]) -> bool {
+    fields.iter().any(|f| f.as_bytes().contains(&0))
+}
+
 fn prepare_title(builder: &Builder, line: &str) -> Result<Prepared> {
     let doc = parse_line(line)?;
     let target_path = doc.target_path.unwrap_or_default();
     let lang = doc.language.unwrap_or_default();
+    if has_interior_nul(&[&doc.path, &doc.title, &target_path, &lang]) {
+        eprintln!(
+            "xapianbuilder: skipping title entry with a NUL byte in path/title: {:?}",
+            doc.path.chars().take(60).collect::<String>()
+        );
+        return Ok(Prepared::Skip);
+    }
     let prepared = builder.prepare_title(&doc.path, &doc.title, &target_path, &lang)?;
     Ok(Prepared::Doc(prepared))
 }
@@ -339,6 +377,13 @@ fn prepare_title(builder: &Builder, line: &str) -> Result<Prepared> {
 fn prepare_fulltext(builder: &Builder, line: &str, rule: AccentRule) -> Result<Prepared> {
     let doc = parse_line(line)?;
     let lang = doc.language.unwrap_or_default();
+    if has_interior_nul(&[&doc.path, &doc.title, &lang]) {
+        eprintln!(
+            "xapianbuilder: skipping entry with a NUL byte in path/title: {:?}",
+            doc.path.chars().take(60).collect::<String>()
+        );
+        return Ok(Prepared::Skip);
+    }
 
     if doc.mimetype.starts_with("text/html") {
         let parsed = ParsedDoc::parse_with(doc.body.as_bytes(), rule)
