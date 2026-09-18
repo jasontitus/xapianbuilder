@@ -98,9 +98,10 @@ int xb_finalize(XbBuilder*);
 // already lowercased + accent-stripped using `accent_rule`
 // (`"libzim"` or `"latin"`; see `xb_builder_new`). `accent_rule` may
 // be NULL or "" for libzim default.
+// Content and keywords may contain embedded NUL bytes; use the returned lengths.
 XbParsedDoc* xb_parse_html(const char* html, size_t len, const char* accent_rule);
 const char* xb_pd_content(const XbParsedDoc*, size_t* out_len);
-const char* xb_pd_keywords(const XbParsedDoc*);
+const char* xb_pd_keywords(const XbParsedDoc*, size_t* out_len);
 uint32_t xb_pd_word_count(const XbParsedDoc*);
 int xb_pd_indexing_allowed(const XbParsedDoc*);
 int xb_pd_has_geo(const XbParsedDoc*);

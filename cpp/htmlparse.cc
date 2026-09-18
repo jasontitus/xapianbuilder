@@ -29,12 +29,12 @@
 // #include "utf8convert.h"
 
 #include <algorithm>
+#include <charconv>
 #include <mutex>
+#include <string_view>
 
 #include <ctype.h>
 #include <cstring>
-#include <stdio.h>
-#include <stdlib.h>
 
 using namespace std;
 
@@ -46,7 +46,7 @@ lowercase_string(string &str)
     }
 }
 
-map<string, unsigned int> zim::HtmlParser::named_ents;
+map<string, unsigned int, std::less<>> zim::HtmlParser::named_ents;
 static std::mutex sInitLock;
 
 inline static bool
@@ -120,61 +120,91 @@ zim::HtmlParser::HtmlParser()
 void
 zim::HtmlParser::decode_entities(string &s)
 {
-    // We need a const_iterator version of s.end() - otherwise the
-    // find() and find_if() templates don't work...
-    string::const_iterator amp = s.begin(), s_end = s.end();
-    while ((amp = find(amp, s_end, '&')) != s_end) {
-	unsigned int val = 0;
-	string::const_iterator end, p = amp + 1;
-	if (p != s_end && *p == '#') {
-	    p++;
-	    if (p != s_end && (*p == 'x' || *p == 'X')) {
-		// hex
-		p++;
-		end = find_if(p, s_end, p_notxdigit);
-		sscanf(s.substr(p - s.begin(), end - p).c_str(), "%x", &val);
-	    } else {
-		// number
-		end = find_if(p, s_end, p_notdigit);
-		val = atoi(s.substr(p - s.begin(), end - p).c_str());
-	    }
-	} else {
-	    end = find_if(p, s_end, p_notalnum);
-	    string code = s.substr(p - s.begin(), end - p);
-	    map<string, unsigned int>::const_iterator i;
-	    i = named_ents.find(code);
-	    if (i != named_ents.end()) val = i->second;
-	}
-	if (end < s_end && *end == ';') end++;
-	if (val) {
-	    string::size_type amp_pos = amp - s.begin();
-	    if (val < 0x80) {
-		s.replace(amp_pos, end - amp, 1u, char(val));
-	    } else {
-		// Convert unicode value val to UTF-8.
-		char seq[4];
-		unsigned len = Xapian::Unicode::nonascii_to_utf8(val, seq);
-		s.replace(amp_pos, end - amp, seq, len);
-	    }
-	    s_end = s.end();
-	    // We've modified the string, so the iterators are no longer
-	    // valid...
-	    amp = s.begin() + amp_pos + 1;
-	} else {
-	    amp = end;
-	}
+    // Decode into the already-consumed prefix. Every replacement is no longer
+    // than its source, so no allocation or repeated suffix shifting is needed.
+    size_t read = 0, write = 0;
+    while (read < s.size()) {
+        const size_t amp = s.find('&', read);
+        const size_t prefix_end = amp == string::npos ? s.size() : amp;
+        const size_t count = prefix_end - read;
+        if (count) std::memmove(s.data() + write, s.data() + read, count);
+        write += count;
+        if (amp == string::npos) break;
+
+        unsigned int val = 0;
+        size_t p = amp + 1;
+        size_t end = p;
+        if (p < s.size() && s[p] == '#') {
+            ++p;
+            int base = 10;
+            if (p < s.size() && (s[p] == 'x' || s[p] == 'X')) {
+                ++p;
+                base = 16;
+            }
+            end = p;
+            while (end < s.size() &&
+                   !(base == 16 ? p_notxdigit(s[end]) : p_notdigit(s[end]))) ++end;
+            const auto result = std::from_chars(s.data() + p, s.data() + end, val, base);
+            if (result.ec == std::errc::result_out_of_range ||
+                val > 0x10ffff || (val >= 0xd800 && val <= 0xdfff)) {
+                val = 0xfffd;
+            }
+        } else {
+            while (end < s.size() && !p_notalnum(s[end])) ++end;
+            auto entity = named_ents.find(std::string_view(s.data() + p, end - p));
+            if (entity != named_ents.end()) val = entity->second;
+        }
+        if (end < s.size() && s[end] == ';') ++end;
+        if (val) {
+            if (val < 0x80) {
+                s[write++] = static_cast<char>(val);
+            } else {
+                char encoded[4];
+                const unsigned length = Xapian::Unicode::nonascii_to_utf8(val, encoded);
+                std::memcpy(s.data() + write, encoded, length);
+                write += length;
+            }
+            read = end;
+        } else {
+            // Unknown references remain literal; an '&' later in their text
+            // can still begin a recognized reference.
+            s[write++] = '&';
+            read = amp + 1;
+        }
     }
+    s.resize(write);
 }
 
 void
 zim::HtmlParser::parse_html(const string &body)
 {
-    in_script = false;
+    raw_text_tag.clear();
 
     parameters.clear();
     string::const_iterator start = body.begin();
 
     while (true) {
+        if (!raw_text_tag.empty()) {
+            // Script/style bodies are raw text. Only their matching end tag
+            // can resume HTML parsing; '</body>' in JS/CSS is not a body end.
+            auto closing = start;
+            while ((closing = find(closing, body.end(), '<')) != body.end()) {
+                const auto remaining = body.end() - closing;
+                if (static_cast<size_t>(remaining) > raw_text_tag.size() + 2 &&
+                    closing[1] == '/' &&
+                    std::equal(raw_text_tag.begin(), raw_text_tag.end(), closing + 2,
+                        [](char expected, char actual) {
+                            return expected == tolower(static_cast<unsigned char>(actual));
+                        })) {
+                    const unsigned char after = closing[raw_text_tag.size() + 2];
+                    if (isspace(after) || after == '/' || after == '>') break;
+                }
+                ++closing;
+            }
+            if (closing == body.end()) break;
+            start = closing;
+            raw_text_tag.clear();
+        }
 	// Skip through until we find an HTML tag, a comment, or the end of
 	// document.  Ignore isolated occurrences of `<' which don't start
 	// a tag or comment.
@@ -182,10 +212,14 @@ zim::HtmlParser::parse_html(const string &body)
 	while (true) {
 	    p = find(p, body.end(), '<');
 	    if (p == body.end()) break;
+	    if (p + 1 == body.end()) {
+		p = body.end();
+		break;
+	    }
 	    unsigned char ch = *(p + 1);
 
 	    // Tag, closing tag, or comment (or SGML declaration).
-	    if ((!in_script && isalpha(ch)) || ch == '/' || ch == '!') break;
+	    if (isalpha(ch) || ch == '/' || ch == '!') break;
 
 	    if (ch == '?') {
 		// PHP code or XML declaration.
@@ -309,7 +343,6 @@ zim::HtmlParser::parse_html(const string &body)
 
 	    if (closing) {
 		closing_tag(tag);
-		if (in_script && tag == "script") in_script = false;
 
 		/* ignore any bogus parameters on closing tags */
 		p = find(start, body.end(), '>');
@@ -329,6 +362,7 @@ zim::HtmlParser::parse_html(const string &body)
 		    start = p;
 		    if (start != body.end() && *start == '=') {
 			start = find_if(start + 1, body.end(), p_notwhitespace);
+			if (start == body.end()) break;
 
 			p = body.end();
 
@@ -365,9 +399,7 @@ zim::HtmlParser::parse_html(const string &body)
 		opening_tag(tag);
 		parameters.clear();
 
-		// In <script> tags we ignore opening tags to avoid problems
-		// with "a<b".
-		if (tag == "script") in_script = true;
+		if (tag == "script" || tag == "style") raw_text_tag = tag;
 
 		if (start != body.end() && *start == '>') ++start;
 	    }

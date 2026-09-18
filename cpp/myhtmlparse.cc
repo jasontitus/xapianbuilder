@@ -26,6 +26,8 @@
 // #include "utf8convert.h"
 
 #include <ctype.h>
+#include <cmath>
+#include <locale>
 #include <sstream>
 #include <string.h>
 
@@ -62,11 +64,19 @@ void zim::MyHtmlParser::process_text(const string &text) {
   }
 }
 
-inline float _stof(std::string str) {
-  std::istringstream stream(str);
-  float ret;
-  stream >> ret;
-  return ret;
+// Geo metadata is optional: reject malformed values without stopping parsing.
+static bool parse_coordinate(const std::string& text, double limit, double& value) {
+  std::istringstream stream(text);
+  stream.imbue(std::locale::classic());
+  double parsed = 0;
+  if (!(stream >> parsed) || !std::isfinite(parsed) ||
+      parsed < -limit || parsed > limit)
+    return false;
+  stream >> std::ws;
+  if (!stream.eof())
+    return false;
+  value = parsed;
+  return true;
 }
 
 void zim::MyHtmlParser::opening_tag(const string &tag) {
@@ -149,12 +159,13 @@ void zim::MyHtmlParser::opening_tag(const string &tag) {
           } else if (name == "geo.position") {
             auto sep_pos = content.find(";");
             if (sep_pos != string::npos) {
-              try {
-                latitude = _stof(content.substr(0, sep_pos));
-                longitude = _stof(content.substr(sep_pos + 1));
+              double parsed_latitude = 0;
+              double parsed_longitude = 0;
+              if (parse_coordinate(content.substr(0, sep_pos), 90, parsed_latitude) &&
+                  parse_coordinate(content.substr(sep_pos + 1), 180, parsed_longitude)) {
+                latitude = parsed_latitude;
+                longitude = parsed_longitude;
                 has_geoPosition = true;
-              } catch (...) {
-                // invalid value in content, just pass and continue.
               }
             }
           }

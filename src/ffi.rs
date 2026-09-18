@@ -67,7 +67,7 @@ unsafe extern "C" {
         accent_rule: *const c_char,
     ) -> *mut XbParsedDoc;
     pub fn xb_pd_content(p: *const XbParsedDoc, out_len: *mut usize) -> *const c_char;
-    pub fn xb_pd_keywords(p: *const XbParsedDoc) -> *const c_char;
+    pub fn xb_pd_keywords(p: *const XbParsedDoc, out_len: *mut usize) -> *const c_char;
     pub fn xb_pd_word_count(p: *const XbParsedDoc) -> c_uint;
     pub fn xb_pd_indexing_allowed(p: *const XbParsedDoc) -> c_int;
     pub fn xb_pd_has_geo(p: *const XbParsedDoc) -> c_int;

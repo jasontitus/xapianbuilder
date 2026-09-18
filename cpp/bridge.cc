@@ -2,13 +2,15 @@
 //
 // Mirrors libzim's xapianIndexer.cpp + xapianWorker.cpp + tools.cpp
 // pipeline so the resulting glass DBs are byte-compatible with kiwix
-// readers. See README and scratch/libzim-ref/* for provenance.
+// readers. See UPSTREAM.md for provenance and the reference checkout:
+// https://github.com/openzim/libzim/tree/dde6c500a7557457ec7117295cfc54442fccb76e/src/writer
 
 #include "bridge.h"
 
 #include <xapian.h>
 
 #include <unicode/locid.h>
+#include <unicode/normalizer2.h>
 #include <unicode/translit.h>
 #include <unicode/unistr.h>
 #include <unicode/utypes.h>
@@ -17,12 +19,15 @@
 #include "myhtmlparse.h"
 
 #include <atomic>
+#include <limits>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 // ---- Constants vendored from libzim/src/constants.h --------------------
@@ -36,67 +41,83 @@ thread_local std::string g_last_error;
 
 void set_error(const std::string& msg) { g_last_error = msg; }
 
-// ---- Accent removal + lowercasing (mirrors libzim's removeAccents) ----
+// ---- Accent removal + lowercasing --------------------------------------
 //
-// Two rules:
-//   - libzim: "Lower; NFD; [:M:] remove; NFC" — strips every combining
-//     mark, regardless of script. Identical to libzim. Fragments Thai
-//     vowel-sign sequences (U+0E30-0E3A) and Indic vowel marks; the
-//     downstream tokeniser then produces consonant-cluster tokens.
-//   - latin:  same shape, but only the four "Combining Diacritical
-//     Marks*" blocks (used by Latin/IPA/symbols) are stripped. Indic /
-//     Thai / Arabic vowel marks survive.
-//
-// The transliterator is built once per rule and reused across calls.
+// Apply root-locale lowercase to the whole input before batched accent
+// removal. Lowercasing chunks independently loses context at their edges
+// (for example Greek final sigma). Accent batches avoid repeated mutation
+// of a large UnicodeString; NFC append repairs composition at their joins.
 
 constexpr const char* RULE_LIBZIM =
-    "Lower; NFD; [:M:] remove; NFC";
+    "NFD; [:M:] remove; NFC";
 // Combining Diacritical Marks blocks: 0300-036F + 1AB0-1AFF (Extended)
 // + 1DC0-1DFF (Supplement) + 20D0-20FF (for Symbols). These cover
 // Latin/Greek/Cyrillic/IPA accent removal; Thai/Devanagari/Arabic vowel
 // signs live elsewhere and pass through.
 constexpr const char* RULE_LATIN_ONLY =
-    "Lower; NFD; "
+    "NFD; "
     "[\\u0300-\\u036F\\u1AB0-\\u1AFF\\u1DC0-\\u1DFF\\u20D0-\\u20FF] remove; "
     "NFC";
 
 icu::Transliterator* build_translit(const std::string& rule_id) {
     UErrorCode status = U_ZERO_ERROR;
     const char* rule = (rule_id == "latin") ? RULE_LATIN_ONLY : RULE_LIBZIM;
-    // Use createInstance (compound-ID parser), exactly like libzim.
-    // createFromRules(...) takes a different rule grammar that doesn't
-    // parse "Lower; NFD; [...] remove; NFC" the way we want.
+    // Compound-ID parser for the normalization/removal pipeline. Lowercase
+    // is applied separately with full string context.
     icu::UnicodeString id(rule, "UTF-8");
-    icu::Transliterator* t =
-        icu::Transliterator::createInstance(id, UTRANS_FORWARD, status);
-    if (U_FAILURE(status)) return nullptr;
-    return t;
+    std::unique_ptr<icu::Transliterator> t(
+        icu::Transliterator::createInstance(id, UTRANS_FORWARD, status));
+    if (U_FAILURE(status) || !t) {
+        throw std::runtime_error(std::string("ICU transliterator: ") +
+                                 u_errorName(status));
+    }
+    return t.release();
 }
 
 std::string remove_accents_lower_with(icu::Transliterator* t, const std::string& s) {
     if (s.empty() || !t) return s;
+    if (s.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::length_error("text exceeds ICU's supported length");
+    }
     icu::UnicodeString us = icu::UnicodeString::fromUTF8(s);
+    us.toLower(icu::Locale::getRoot());
+    if (us.isBogus()) throw std::bad_alloc();
 
     constexpr int32_t BATCH = 4 * 1024;
     if (us.length() <= BATCH) {
         t->transliterate(us);
+        if (us.isBogus()) throw std::bad_alloc();
         std::string out;
         us.toUTF8String(out);
         return out;
     }
+    UErrorCode status = U_ZERO_ERROR;
+    const auto* normalizer = icu::Normalizer2::getNFCInstance(status);
+    if (U_FAILURE(status)) {
+        throw std::runtime_error(std::string("ICU normalizer: ") + u_errorName(status));
+    }
 
-    std::string out;
+    icu::UnicodeString normalized;
     int32_t pos = 0;
     icu::UnicodeString chunk;
     while (pos < us.length()) {
-        int32_t end = us.getChar32Limit(pos + BATCH);
+        int32_t end = us.getChar32Limit(
+            us.length() - pos > BATCH ? pos + BATCH : us.length());
+        // Each chunk is normalized separately, then joined with NFC boundary
+        // repair. Mark deletion can expose composing characters across a seam.
         int32_t len = end - pos;
         chunk.remove();
         us.extract(pos, len, chunk);
         t->transliterate(chunk);
-        chunk.toUTF8String(out);
+        if (chunk.isBogus()) throw std::bad_alloc();
+        normalizer->append(normalized, chunk, status);
+        if (U_FAILURE(status) || normalized.isBogus()) {
+            throw std::runtime_error(std::string("ICU normalization append: ") + u_errorName(status));
+        }
         pos += len;
     }
+    std::string out;
+    normalized.toUTF8String(out);
     return out;
 }
 
@@ -186,7 +207,7 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
                                      int mode) {
     try {
         ucnv_setDefaultName("UTF-8");
-        auto* b = new XbBuilder;
+        auto b = std::unique_ptr<XbBuilder>(new XbBuilder);
         b->tmp_path = tmp_path;
         b->final_path = final_path;
         b->language = language_iso6393 ? language_iso6393 : "";
@@ -239,7 +260,10 @@ extern "C" XbBuilder* xb_builder_new(const char* tmp_path,
         b->db.set_metadata("language", b->language);
         b->db.set_metadata("stopwords", sw);
 
-        return b;
+        return b.release();
+    } catch (const Xapian::Error& e) {
+        set_error(std::string("xb_builder_new: ") + e.get_description());
+        return nullptr;
     } catch (const std::exception& e) {
         set_error(std::string("xb_builder_new: ") + e.what());
         return nullptr;
@@ -286,13 +310,13 @@ static const Xapian::Stem* resolve_stem(const XbBuilder* b,
     // Try literal first.
     try {
         stem.reset(new Xapian::Stem(key));
-    } catch (...) {
+    } catch (const Xapian::InvalidArgumentError&) {
         // Fall back to ICU language-code resolution ("eng" -> "en").
         std::string resolved = stemmer_lang_for(key);
         if (!resolved.empty() && resolved != key) {
             try {
                 stem.reset(new Xapian::Stem(resolved));
-            } catch (...) {}
+            } catch (const Xapian::InvalidArgumentError&) {}
         }
     }
     it = cache.emplace(key, std::move(stem)).first;
@@ -354,6 +378,9 @@ extern "C" XbDoc* xb_prepare_title(const XbBuilder* b,
             }
         }
         return out.release();
+    } catch (const Xapian::Error& e) {
+        set_error(std::string("xb_prepare_title: ") + e.get_description());
+        return nullptr;
     } catch (const std::exception& e) {
         set_error(std::string("xb_prepare_title: ") + e.what());
         return nullptr;
@@ -380,6 +407,13 @@ extern "C" XbDoc* xb_prepare_fulltext(const XbBuilder* b,
         return nullptr;
     }
     try {
+        // HTML parsing omits invalid optional tags. Direct callers must
+        // supply finite coordinates within the geographic bounds.
+        if (has_geo && (!std::isfinite(latitude) || !std::isfinite(longitude) ||
+                        latitude < -90 || latitude > 90 ||
+                        longitude < -180 || longitude > 180)) {
+            throw Xapian::InvalidArgumentError("invalid geo coordinates");
+        }
         const std::string path_s = path ? path : "";
         const std::string title_raw = title ? title : "";
         const std::string content_s =
@@ -428,6 +462,9 @@ extern "C" XbDoc* xb_prepare_fulltext(const XbBuilder* b,
             indexer.index_text_without_positions(keywords_s, 3);
 
         return out.release();
+    } catch (const Xapian::Error& e) {
+        set_error(std::string("xb_prepare_fulltext: ") + e.get_description());
+        return nullptr;
     } catch (const std::exception& e) {
         set_error(std::string("xb_prepare_fulltext: ") + e.what());
         return nullptr;
@@ -447,6 +484,9 @@ extern "C" int xb_add_doc(XbBuilder* b, const XbDoc* d) {
         b->db.add_document(d->doc);
         b->empty.store(false, std::memory_order_relaxed);
         return 0;
+    } catch (const Xapian::Error& e) {
+        set_error(std::string("xb_add_doc: ") + e.get_description());
+        return -1;
     } catch (const std::exception& e) {
         set_error(std::string("xb_add_doc: ") + e.what());
         return -1;
@@ -459,7 +499,10 @@ extern "C" int xb_add_doc(XbBuilder* b, const XbDoc* d) {
 extern "C" void xb_doc_free(XbDoc* d) { delete d; }
 
 extern "C" int xb_finalize(XbBuilder* b) {
-    if (!b) return -1;
+    if (!b) {
+        set_error("xb_finalize: null builder");
+        return -1;
+    }
     try {
         b->db.commit();
         b->db.compact(b->final_path,
@@ -467,6 +510,9 @@ extern "C" int xb_finalize(XbBuilder* b) {
                           Xapian::Compactor::FULL);
         b->db.close();
         return 0;
+    } catch (const Xapian::Error& e) {
+        set_error(std::string("xb_finalize: ") + e.get_description());
+        return -1;
     } catch (const std::exception& e) {
         set_error(std::string("xb_finalize: ") + e.what());
         return -1;
@@ -490,16 +536,19 @@ struct XbParsedDoc {
 
 extern "C" XbParsedDoc* xb_parse_html(const char* html, size_t len, const char* accent_rule) {
     try {
+        if (!html && len != 0) {
+            throw std::invalid_argument("null HTML buffer with nonzero length");
+        }
         zim::MyHtmlParser parser;
         std::string body(html ? html : "", html ? len : 0);
         try {
             parser.parse_html(body, "UTF-8", true);
-        } catch (...) {
-            // MyHtmlParser uses exceptions for control flow on certain
-            // tags (e.g. <noindex>); the partial state in `dump` is
-            // still valid, matching libzim's behaviour.
+        } catch (bool) {
+            // MyHtmlParser stops at </body> and robots=noindex with a
+            // bool exception. Only those deliberate stops retain partial
+            // state; genuine parser failures must reach the C ABI handler.
         }
-        auto* p = new XbParsedDoc;
+        auto p = std::unique_ptr<XbParsedDoc>(new XbParsedDoc);
         p->word_count = count_words(parser.dump);
         p->indexing_allowed =
             !parser.dump.empty() && parser.indexing_allowed &&
@@ -514,7 +563,10 @@ extern "C" XbParsedDoc* xb_parse_html(const char* html, size_t len, const char* 
         icu::Transliterator* t = tl_translit(rule);
         p->content = remove_accents_lower_with(t, parser.dump);
         p->keywords = remove_accents_lower_with(t, parser.keywords);
-        return p;
+        return p.release();
+    } catch (const Xapian::Error& e) {
+        set_error(std::string("xb_parse_html: ") + e.get_description());
+        return nullptr;
     } catch (const std::exception& e) {
         set_error(std::string("xb_parse_html: ") + e.what());
         return nullptr;
@@ -528,7 +580,8 @@ extern "C" const char* xb_pd_content(const XbParsedDoc* p, size_t* out_len) {
     if (out_len) *out_len = p ? p->content.size() : 0;
     return p ? p->content.c_str() : "";
 }
-extern "C" const char* xb_pd_keywords(const XbParsedDoc* p) {
+extern "C" const char* xb_pd_keywords(const XbParsedDoc* p, size_t* out_len) {
+    if (out_len) *out_len = p ? p->keywords.size() : 0;
     return p ? p->keywords.c_str() : "";
 }
 extern "C" uint32_t xb_pd_word_count(const XbParsedDoc* p) {

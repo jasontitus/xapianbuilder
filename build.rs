@@ -2,47 +2,71 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn pkg_config(args: &[&str]) -> Vec<String> {
-    let mut pkg_path =
-        env::var("PKG_CONFIG_PATH").unwrap_or_default();
-    // Brew installs icu4c keg-only; auto-add its pkgconfig dir if present.
-    for prefix in ["/opt/homebrew/opt/icu4c@78", "/opt/homebrew/opt/icu4c"] {
-        let p = format!("{prefix}/lib/pkgconfig");
-        if PathBuf::from(&p).exists() {
-            if !pkg_path.is_empty() {
-                pkg_path.push(':');
-            }
-            pkg_path.push_str(&p);
-            break;
+fn add_homebrew_icu_path() {
+    let host = env::var("HOST").expect("Cargo sets HOST");
+    let target = env::var("TARGET").expect("Cargo sets TARGET");
+    if host != target || !target.contains("apple-darwin") {
+        return;
+    }
+
+    // Explicit pkg-config configuration takes precedence, including an empty
+    // value. Do not inject host paths into a cross-compilation environment.
+    let target_underscores = target.replace('-', "_");
+    let mut configured = false;
+    for name in [
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_LIBDIR",
+        "PKG_CONFIG_SYSROOT_DIR",
+    ] {
+        for key in [
+            name.to_owned(),
+            format!("HOST_{name}"),
+            format!("{name}_{target}"),
+            format!("{name}_{target_underscores}"),
+        ] {
+            println!("cargo:rerun-if-env-changed={key}");
+            configured |= env::var_os(&key).is_some();
         }
     }
-    let out = Command::new("pkg-config")
-        .env("PKG_CONFIG_PATH", &pkg_path)
-        .args(args)
-        .output()
-        .expect("pkg-config failed (is it installed?)");
-    if !out.status.success() {
-        panic!(
-            "pkg-config {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    if configured {
+        return;
     }
-    String::from_utf8(out.stdout)
-        .unwrap()
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
+
+    println!("cargo:rerun-if-env-changed=PATH");
+    let brew_prefix = Command::new("brew")
+        .args(["--prefix", "icu4c"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|prefix| PathBuf::from(prefix.trim()));
+    for prefix in brew_prefix.into_iter().chain([
+        PathBuf::from("/opt/homebrew/opt/icu4c"),
+        PathBuf::from("/usr/local/opt/icu4c"),
+    ]) {
+        let path = prefix.join("lib/pkgconfig");
+        if path.is_dir() {
+            env::set_var("PKG_CONFIG_PATH", path);
+            return;
+        }
+    }
+}
+
+fn probe(package: &str, metadata: bool) -> pkg_config::Library {
+    pkg_config::Config::new()
+        .cargo_metadata(metadata)
+        .probe(package)
+        .unwrap_or_else(|error| {
+            panic!("Cannot discover {package}: {error}\nInstall Xapian and ICU development packages and pkg-config; see README.md.")
+        })
 }
 
 fn main() {
     println!("cargo:rerun-if-changed=cpp");
     println!("cargo:rerun-if-changed=build.rs");
+    add_homebrew_icu_path();
 
-    let cflags_xapian = pkg_config(&["--cflags", "xapian-core"]);
-    let libs_xapian = pkg_config(&["--libs", "xapian-core"]);
-    let cflags_icu = pkg_config(&["--cflags", "icu-uc", "icu-i18n"]);
-    let libs_icu = pkg_config(&["--libs", "icu-uc", "icu-i18n"]);
-
+    let packages = ["xapian-core", "icu-uc", "icu-i18n"];
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -51,29 +75,21 @@ fn main() {
         .file("cpp/htmlparse.cc")
         .file("cpp/myhtmlparse.cc")
         .file("cpp/bridge.cc");
-
-    for f in cflags_xapian.iter().chain(cflags_icu.iter()) {
-        if let Some(rest) = f.strip_prefix("-I") {
-            build.include(rest);
-        } else {
-            build.flag(f);
+    for package in packages {
+        let library = probe(package, false);
+        for include in library.include_paths {
+            build.include(include);
+        }
+        for (name, value) in library.defines {
+            build.define(&name, value.as_deref());
         }
     }
     build.compile("xapianbuilder_cpp");
 
-    for f in libs_xapian.iter().chain(libs_icu.iter()) {
-        if let Some(rest) = f.strip_prefix("-L") {
-            println!("cargo:rustc-link-search=native={rest}");
-        } else if let Some(rest) = f.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib={rest}");
-        } else if f.starts_with("-framework") {
-            // pass through
-        }
+    // Emit dependency links after the wrapper archive, using the crate's full
+    // handling of frameworks, static dependencies, and platform linker flags.
+    for package in packages {
+        probe(package, true);
     }
-    // Link C++ runtime explicitly on macOS/Linux.
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=c++");
-    } else {
-        println!("cargo:rustc-link-lib=stdc++");
-    }
+    // cc selects the target's C++ runtime and honors CXXSTDLIB overrides.
 }

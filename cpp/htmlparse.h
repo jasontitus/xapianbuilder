@@ -37,9 +37,9 @@ class HtmlParser {
 	map<string, string> parameters;
     protected:
 	void decode_entities(string &s);
-	bool in_script;
+	string raw_text_tag;
 	string charset;
-	static map<string, unsigned int> named_ents;
+	static map<string, unsigned int, std::less<>> named_ents;
 
 	bool get_parameter(const string & param, string & value);
     public:

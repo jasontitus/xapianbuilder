@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Independent writer baseline, not a dependency of xapianbuilder itself.
+      LIBZIM_REFERENCE_REVISION: 351df21b348fdafe6566a472a0d9bf8d965bde48
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libxapian-dev xapian-tools libicu-dev liblzma-dev libzstd-dev python3 meson ninja-build git
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkgconf xapian icu4c xz zstd meson ninja python
+          echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig:$(brew --prefix xapian)/lib/pkgconfig" >> "$GITHUB_ENV"
+          if ! command -v xapian-delve >/dev/null; then
+            candidate="$(brew --prefix xapian)/bin/delve"
+            test -x "$candidate"
+            mkdir -p "$RUNNER_TEMP/xapian-tools"
+            ln -s "$candidate" "$RUNNER_TEMP/xapian-tools/xapian-delve"
+            echo "$RUNNER_TEMP/xapian-tools" >> "$GITHUB_PATH"
+          fi
+      - name: Build pinned libzim 9.8.1 reference
+        run: |
+          git init "$RUNNER_TEMP/libzim-source"
+          git -C "$RUNNER_TEMP/libzim-source" fetch --depth=1 https://github.com/openzim/libzim.git "$LIBZIM_REFERENCE_REVISION"
+          git -C "$RUNNER_TEMP/libzim-source" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/libzim-source" rev-parse HEAD)" = "$LIBZIM_REFERENCE_REVISION"
+          meson setup "$RUNNER_TEMP/libzim-build" "$RUNNER_TEMP/libzim-source" \
+            --prefix="$RUNNER_TEMP/libzim-reference" --libdir=lib --buildtype=release \
+            --wrap-mode=nofallback -Dtests=false -Dexamples=false -Dwerror=false
+          meson compile -C "$RUNNER_TEMP/libzim-build" -j2
+          meson install -C "$RUNNER_TEMP/libzim-build"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/libzim-reference/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/libzim-reference/lib" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$RUNNER_TEMP/libzim-reference/lib" >> "$GITHUB_ENV"
+      - name: Require inspection tools and record versions
+        run: |
+          command -v xapian-delve
+          xapian-delve --version
+          pkg-config --modversion xapian-core icu-uc icu-i18n libzim
+          rustc --version
+          cargo --version
+          c++ --version
+          python3 --version
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - run: python3 bench/test-search-fidelity.py
+      - name: Compare against libzim
+        run: |
+          mkdir -p comparison-results
+          python3 bench/compare-upstream.py --builder target/release/xapianbuilder --out comparison-results
+      - name: Reject value-only mismatches without termlists
+        run: python3 bench/test-upstream-values.py --builder target/release/xapianbuilder
+      - name: Preserve comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparison-${{ matrix.os }}
+          path: comparison-results/
+          if-no-files-found: ignore
+
+  native-sanitizers:
+    runs-on: ubuntu-24.04
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native sanitizer dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libxapian-dev xapian-tools libicu-dev
+      - name: Build native boundary sanitizer harness
+        run: |
+          g++ -std=c++17 -g -O1 -fsanitize=address,undefined \
+            -fno-omit-frame-pointer -Icpp \
+            tests/native_safety.cc cpp/bridge.cc cpp/htmlparse.cc cpp/myhtmlparse.cc \
+            $(pkg-config --cflags --libs xapian-core icu-uc icu-i18n) \
+            -o "$RUNNER_TEMP/native-safety"
+      - name: Exercise native ownership and malformed inputs
+        run: |
+          workspace=$(mktemp -d)
+          trap 'rm -rf "$workspace"' EXIT
+          "$RUNNER_TEMP/native-safety" "$workspace"

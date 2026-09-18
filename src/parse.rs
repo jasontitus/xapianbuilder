@@ -1,6 +1,8 @@
 //! Safe wrapper over `xb_parse_html`.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
+
+use anyhow::{anyhow, Result};
 
 use crate::ffi;
 use crate::AccentRule;
@@ -12,20 +14,20 @@ pub struct ParsedDoc {
 impl ParsedDoc {
     /// Parse the HTML buffer, applying the libzim accent rule to
     /// extracted content/keywords. For the latin rule, see
-    /// [`Self::parse_with`].
-    pub fn parse(html: &[u8]) -> Option<Self> {
+    /// [`Self::parse_with`]. Native failures retain their diagnostic in
+    /// the returned error; malformed optional geo metadata is ignored.
+    pub fn parse(html: &[u8]) -> Result<Self> {
         Self::parse_with(html, AccentRule::Libzim)
     }
 
-    pub fn parse_with(html: &[u8], rule: AccentRule) -> Option<Self> {
-        let rule_c = CString::new(rule.as_str()).ok()?;
-        let raw = unsafe {
-            ffi::xb_parse_html(html.as_ptr() as *const _, html.len(), rule_c.as_ptr())
-        };
+    pub fn parse_with(html: &[u8], rule: AccentRule) -> Result<Self> {
+        let rule_c = CString::new(rule.as_str())?;
+        let raw =
+            unsafe { ffi::xb_parse_html(html.as_ptr() as *const _, html.len(), rule_c.as_ptr()) };
         if raw.is_null() {
-            None
+            Err(anyhow!("parsing HTML: {}", crate::last_error()))
         } else {
-            Some(ParsedDoc { raw })
+            Ok(ParsedDoc { raw })
         }
     }
 
@@ -36,19 +38,20 @@ impl ParsedDoc {
             if p.is_null() || len == 0 {
                 return "";
             }
-            let bytes = std::slice::from_raw_parts(p as *const u8, len);
+            let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len);
             std::str::from_utf8(bytes).unwrap_or("")
         }
     }
 
     pub fn keywords(&self) -> &str {
+        let mut len = 0usize;
         unsafe {
-            let p = ffi::xb_pd_keywords(self.raw);
-            if p.is_null() {
-                ""
-            } else {
-                CStr::from_ptr(p).to_str().unwrap_or("")
+            let p = ffi::xb_pd_keywords(self.raw, &mut len);
+            if p.is_null() || len == 0 {
+                return "";
             }
+            let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len);
+            std::str::from_utf8(bytes).unwrap_or("")
         }
     }
 
@@ -63,7 +66,10 @@ impl ParsedDoc {
             if ffi::xb_pd_has_geo(self.raw) == 0 {
                 None
             } else {
-                Some((ffi::xb_pd_latitude(self.raw), ffi::xb_pd_longitude(self.raw)))
+                Some((
+                    ffi::xb_pd_latitude(self.raw),
+                    ffi::xb_pd_longitude(self.raw),
+                ))
             }
         }
     }

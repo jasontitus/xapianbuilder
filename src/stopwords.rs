@@ -35,12 +35,11 @@ fn table() -> &'static HashMap<&'static str, &'static str> {
     TABLE.get_or_init(|| {
         // Keep this list in sync with `data/stopwords/`.
         sw!(
-            "af", "ar", "bg", "bn", "br", "ca", "cs", "da", "de", "el",
-            "en", "eo", "es", "et", "eu", "fa", "fi", "fr", "ga", "gl",
-            "gu", "ha", "he", "hi", "hr", "hu", "hy", "id", "it", "ja",
-            "ko", "ku", "la", "lt", "lv", "mr", "ms", "nl", "no", "pl",
-            "pt", "ro", "ru", "sk", "sl", "so", "st", "sv", "sw", "th",
-            "tl", "tr", "uk", "ur", "vi", "yo", "zh", "zu",
+            "af", "ar", "bg", "bn", "br", "ca", "cs", "da", "de", "el", "en", "eo", "es", "et",
+            "eu", "fa", "fi", "fr", "ga", "gl", "gu", "ha", "he", "hi", "hr", "hu", "hy", "id",
+            "it", "ja", "ko", "ku", "la", "lt", "lv", "mr", "ms", "nl", "no", "pl", "pt", "ro",
+            "ru", "sk", "sl", "so", "st", "sv", "sw", "th", "tl", "tr", "uk", "ur", "vi", "yo",
+            "zh", "zu",
         )
     })
 }

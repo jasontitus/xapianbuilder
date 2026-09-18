@@ -39,7 +39,7 @@ class MyHtmlParser : public HtmlParser {
 	bool pending_space;
 	bool indexing_allowed;
 	bool charset_from_meta;
-    float latitude, longitude;
+    double latitude, longitude;
     bool has_geoPosition;
 	string title, sample, keywords, dump;
 	void process_text(const string &text);

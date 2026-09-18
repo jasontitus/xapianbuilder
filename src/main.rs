@@ -1,15 +1,18 @@
 //! `xapianbuilder` — CLI for building kiwix-compatible Xapian indexes.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Lines, Read, stdin};
+use std::io::{stdin, BufRead, BufReader, Lines, Read};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use xapianbuilder::{AccentRule, Builder, Mode, PreparedDoc, parse::ParsedDoc, stopwords};
+use xapianbuilder::{
+    parse::ParsedDoc, stopwords, AccentRule, Builder, BuilderOptions, FulltextDocument, Mode,
+    PreparedDoc,
+};
 
 /// Parallel-pipeline chunk size — the JSONL reader buffers up to
 /// CHUNK lines, then dispatches them across worker threads. Larger
@@ -53,9 +56,8 @@ struct BuildArgs {
     /// JSONL file with one document per line. Use "-" for stdin.
     #[arg(long)]
     input: String,
-    /// Path to write the final single-file glass DB. The same path
-    /// with a `.tmp` suffix is used as the WritableDatabase scratch
-    /// directory and is removed on success.
+    /// Final single-file glass DB. Published without overwriting an existing
+    /// path; a private workspace beside it is cleaned up after the build.
     #[arg(long)]
     output: PathBuf,
     /// Language string passed straight through to ICU (for stemmer
@@ -101,21 +103,16 @@ struct BuildArgs {
     /// won't byte-match a kiwix-built reference.
     #[arg(long)]
     keep_termlists: bool,
-    /// ICU accent-removal pipeline. `libzim` (default) matches kiwix
-    /// exactly: `Lower; NFD; [:M:] remove; NFC`. That fragments
-    /// Indic/Thai/Arabic vowel marks. Pass `latin` to only strip
-    /// Latin/IPA combining marks; non-Latin scripts pass through and
-    /// tokenize correctly, at the cost of byte-divergence from libzim
-    /// on those corpora.
+    /// ICU accent-removal pipeline. `libzim` uses `Lower; NFD; [:M:]
+    /// remove; NFC`. `latin` preserves marks outside selected combining
+    /// blocks, changing search behavior and diverging from libzim.
     #[arg(long, value_parser = ["libzim", "latin"], default_value = "libzim")]
     accent_rule: String,
     /// Documents buffered in memory between Xapian B-tree flushes
     /// (sets XAPIAN_FLUSH_THRESHOLD). Higher = faster bulk builds,
     /// more memory. Defaults to 50000 (Xapian's own default is 10000);
     /// an already-set XAPIAN_FLUSH_THRESHOLD env var wins over the
-    /// default but loses to an explicit flag. Has no effect on the
-    /// final file's bytes — the output is fully rewritten by
-    /// compaction either way.
+    /// default but loses to an explicit flag.
     #[arg(long)]
     flush_threshold: Option<u32>,
     /// Suppress progress output.
@@ -156,17 +153,6 @@ fn main() -> Result<()> {
 }
 
 fn run(args: BuildArgs, mode: Mode) -> Result<()> {
-    if args.output.exists() {
-        bail!(
-            "output path already exists: {} (xapianbuilder refuses to overwrite)",
-            args.output.display()
-        );
-    }
-    let tmp = with_suffix(&args.output, ".tmp");
-    if tmp.exists() {
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
     // Xapian reads XAPIAN_FLUSH_THRESHOLD when the WritableDatabase is
     // created, so this must happen before Builder::new. We're still
     // single-threaded here (the rayon pool spins up lazily later).
@@ -194,14 +180,15 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
         _ => AccentRule::Libzim,
     };
     let builder = Builder::new(
-        &tmp,
         &args.output,
-        &args.language,
-        stopwords_text,
-        &args.stemmer,
-        accent_rule,
-        args.keep_termlists,
-        mode,
+        BuilderOptions {
+            language: &args.language,
+            stopwords: stopwords_text,
+            stemmer: &args.stemmer,
+            accent_rule,
+            keep_termlists: args.keep_termlists,
+            mode,
+        },
     )?;
 
     if args.jobs > 0 {
@@ -216,9 +203,7 @@ fn run(args: BuildArgs, mode: Mode) -> Result<()> {
     let reader: Box<dyn Read + Send> = if args.input == "-" {
         Box::new(stdin())
     } else {
-        Box::new(File::open(&args.input).with_context(|| {
-            format!("opening input {}", &args.input)
-        })?)
+        Box::new(File::open(&args.input).with_context(|| format!("opening input {}", args.input))?)
     };
     let mut lines = BufReader::with_capacity(1 << 20, reader).lines();
 
@@ -325,10 +310,10 @@ fn prepare_chunk(
 
 /// Serial leg: append prepared documents in input order.
 fn write_docs(builder: &Builder, docs: Vec<Prepared>, count: &mut u64) -> Result<()> {
-    *count += docs.len() as u64;
     for prepared in docs {
         if let Prepared::Doc(doc) = prepared {
             builder.add_doc(&doc)?;
+            *count += 1;
         }
     }
     Ok(())
@@ -342,8 +327,12 @@ enum Prepared {
 }
 
 fn parse_line(line: &str) -> Result<InputDoc> {
-    serde_json::from_str(line)
-        .with_context(|| format!("parsing JSONL: {}", line.chars().take(80).collect::<String>()))
+    serde_json::from_str(line).with_context(|| {
+        format!(
+            "parsing JSONL: {}",
+            line.chars().take(80).collect::<String>()
+        )
+    })
 }
 
 /// True when any field that has to cross the C ABI as a NUL-terminated
@@ -391,15 +380,15 @@ fn prepare_fulltext(builder: &Builder, line: &str, rule: AccentRule) -> Result<P
         if !parsed.indexing_allowed() {
             return Ok(Prepared::Skip);
         }
-        let prepared = builder.prepare_fulltext(
-            &doc.path,
-            &doc.title,
-            parsed.content().as_bytes(),
-            parsed.keywords().as_bytes(),
-            parsed.word_count(),
-            parsed.geo(),
-            &lang,
-        )?;
+        let prepared = builder.prepare_fulltext(FulltextDocument {
+            path: &doc.path,
+            title: &doc.title,
+            content: parsed.content().as_bytes(),
+            keywords: parsed.keywords().as_bytes(),
+            word_count: parsed.word_count(),
+            geo: parsed.geo(),
+            language: &lang,
+        })?;
         Ok(Prepared::Doc(prepared))
     } else {
         // Non-HTML mimetypes pass through verbatim. libzim only
@@ -410,21 +399,15 @@ fn prepare_fulltext(builder: &Builder, line: &str, rule: AccentRule) -> Result<P
             return Ok(Prepared::Skip);
         }
         let word_count = doc.body.split_whitespace().count() as u32;
-        let prepared = builder.prepare_fulltext(
-            &doc.path,
-            &doc.title,
-            doc.body.as_bytes(),
-            b"",
+        let prepared = builder.prepare_fulltext(FulltextDocument {
+            path: &doc.path,
+            title: &doc.title,
+            content: doc.body.as_bytes(),
+            keywords: b"",
             word_count,
-            None,
-            &lang,
-        )?;
+            geo: None,
+            language: &lang,
+        })?;
         Ok(Prepared::Doc(prepared))
     }
-}
-
-fn with_suffix(p: &PathBuf, suffix: &str) -> PathBuf {
-    let mut s = p.clone().into_os_string();
-    s.push(suffix);
-    PathBuf::from(s)
 }

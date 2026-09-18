@@ -6,7 +6,8 @@
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, bail, Context, Result};
+use tempfile::TempDir;
 
 mod ffi;
 pub mod parse;
@@ -29,12 +30,11 @@ impl Mode {
 
 /// Which ICU accent-removal pipeline to apply before tokenisation.
 ///
-/// `Libzim` matches kiwix exactly (`"Lower; NFD; [:M:] remove; NFC"`)
-/// and fragments Indic/Thai/Arabic vowel marks as a side-effect.
-/// `Latin` only strips combining marks in the Latin/IPA blocks
-/// (`U+0300-036F`, `U+1AB0-1AFF`, `U+1DC0-1DFF`, `U+20D0-20FF`),
-/// preserving Indic/Thai/Arabic correctness at the cost of byte
-/// divergence from libzim on those scripts.
+/// `Libzim` uses `"Lower; NFD; [:M:] remove; NFC"`, removing combining
+/// marks across scripts. `Latin` removes marks only in selected blocks
+/// (`U+0300-036F`, `U+1AB0-1AFF`, `U+1DC0-1DFF`, `U+20D0-20FF`).
+/// The latter preserves more non-Latin marks but differs from libzim;
+/// neither option guarantees linguistically correct search for every script.
 #[derive(Copy, Clone, Debug)]
 pub enum AccentRule {
     Libzim,
@@ -50,18 +50,40 @@ impl AccentRule {
     }
 }
 
-pub struct Builder {
-    raw: *mut ffi::XbBuilder,
-    tmp_path: PathBuf,
-    finalized: bool,
+/// Index settings shared by all documents in one database.
+pub struct BuilderOptions<'a> {
+    pub language: &'a str,
+    pub stopwords: &'a str,
+    /// Empty derives from `language`; `"none"` disables stemming.
+    pub stemmer: &'a str,
+    pub accent_rule: AccentRule,
+    pub keep_termlists: bool,
+    pub mode: Mode,
 }
 
-// SAFETY: every method that touches `raw` either takes `&mut self`,
+/// Fulltext fields. Content and keywords must already be normalized;
+/// the builder normalizes the original title using its accent rule.
+pub struct FulltextDocument<'a> {
+    pub path: &'a str,
+    pub title: &'a str,
+    pub content: &'a [u8],
+    pub keywords: &'a [u8],
+    pub word_count: u32,
+    pub geo: Option<(f64, f64)>,
+    pub language: &'a str,
+}
+
+pub struct Builder {
+    raw: *mut ffi::XbBuilder,
+    workspace: TempDir,
+    final_path: PathBuf,
+}
+
+// SAFETY: every method that touches `raw` either consumes self,
 // only reads builder state that is immutable after construction
-// (xb_prepare_*), or goes through a function the C++ side guards with
-// its own mutex (xb_add_doc). The C ABI is therefore safe to use from
-// multiple threads holding shared references to the same builder;
-// that's how the parallel feeder in main.rs uses it.
+// (xb_prepare_*), reads an atomic (xb_builder_is_empty), or goes through
+// a function the C++ side guards with its own mutex (xb_add_doc).
+// Shared references can therefore be used by the parallel feeder in main.rs.
 unsafe impl Send for Builder {}
 unsafe impl Sync for Builder {}
 
@@ -88,34 +110,37 @@ impl Drop for PreparedDoc {
 }
 
 impl Builder {
-    /// `tmp_path` is the workspace where the WritableDatabase is written
-    /// before compaction; `final_path` is where the single-file glass
-    /// blob ends up. They must be different paths (libzim convention is
-    /// `<final>.tmp`). The temp path is removed on Drop regardless of
-    /// whether `finalize()` succeeded, so callers don't have to clean
-    /// up on error.
+    /// Creates a private workspace beside `final_path`. Existing files,
+    /// directories and symlinks are never overwritten. The parent must exist.
     ///
-    /// `stemmer_override` is forwarded straight to `Xapian::Stem` if
-    /// non-empty: pass `"porter"` for old-style stemming (matches
-    /// pre-2024 kiwix ZIMs), `""` to derive the stemmer from
-    /// `language_iso6393` via ICU, `"none"` to disable stemming.
-    pub fn new(
-        tmp_path: &Path,
-        final_path: &Path,
-        language_iso6393: &str,
-        stopwords_text: &str,
-        stemmer_override: &str,
-        accent_rule: AccentRule,
-        keep_termlists: bool,
-        mode: Mode,
-    ) -> Result<Self> {
-        let tmp = path_to_cstring(tmp_path)?;
-        let fin = path_to_cstring(final_path)?;
-        let lang = CString::new(language_iso6393)?;
-        let sw = CString::new(stopwords_text)?;
-        let stemmer = CString::new(stemmer_override)?;
-        let rule = CString::new(accent_rule.as_str())?;
-
+    /// Only this builder's workspace is removed on failure or drop. On success,
+    /// a complete database is published atomically without replacing a competing
+    /// writer's output. Scratch paths are deliberately not caller-configurable.
+    pub fn new(final_path: &Path, options: BuilderOptions<'_>) -> Result<Self> {
+        let filename = final_path.file_name().context("output must name a file")?;
+        let parent = final_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = parent
+            .canonicalize()
+            .with_context(|| format!("opening output directory {}", parent.display()))?;
+        let final_path = parent.join(filename);
+        match std::fs::symlink_metadata(&final_path) {
+            Ok(_) => bail!("output path already exists: {}", final_path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("checking output path"),
+        }
+        let workspace = tempfile::Builder::new()
+            .prefix(".xapianbuilder-")
+            .tempdir_in(parent)
+            .context("creating private index workspace")?;
+        let tmp = path_to_cstring(&workspace.path().join("database"))?;
+        let fin = path_to_cstring(&workspace.path().join("compacted"))?;
+        let lang = CString::new(options.language)?;
+        let sw = CString::new(options.stopwords)?;
+        let stemmer = CString::new(options.stemmer)?;
+        let rule = CString::new(options.accent_rule.as_str())?;
         let raw = unsafe {
             ffi::xb_builder_new(
                 tmp.as_ptr(),
@@ -124,8 +149,8 @@ impl Builder {
                 sw.as_ptr(),
                 stemmer.as_ptr(),
                 rule.as_ptr(),
-                if keep_termlists { 1 } else { 0 },
-                mode.as_int(),
+                if options.keep_termlists { 1 } else { 0 },
+                options.mode.as_int(),
             )
         };
         if raw.is_null() {
@@ -133,8 +158,8 @@ impl Builder {
         }
         Ok(Builder {
             raw,
-            tmp_path: tmp_path.to_path_buf(),
-            finalized: false,
+            workspace,
+            final_path,
         })
     }
 
@@ -180,19 +205,19 @@ impl Builder {
     /// produced by [`parse::ParsedDoc`]); `title` is raw — the
     /// builder's accent rule is applied to it internally, matching
     /// libzim.
-    pub fn prepare_fulltext(
-        &self,
-        path: &str,
-        title: &str,
-        content: &[u8],
-        keywords: &[u8],
-        word_count: u32,
-        geo: Option<(f64, f64)>,
-        lang_override: &str,
-    ) -> Result<PreparedDoc> {
+    pub fn prepare_fulltext(&self, input: FulltextDocument<'_>) -> Result<PreparedDoc> {
+        let FulltextDocument {
+            path,
+            title,
+            content,
+            keywords,
+            word_count,
+            geo,
+            language,
+        } = input;
         let path_c = CString::new(path)?;
         let title_c = CString::new(title)?;
-        let lang_c = CString::new(lang_override)?;
+        let lang_c = CString::new(language)?;
         let (has_geo, lat, lng) = match geo {
             Some((lat, lng)) => (1, lat, lng),
             None => (0, 0.0, 0.0),
@@ -242,33 +267,27 @@ impl Builder {
     }
 
     /// Convenience: prepare + add in one call.
-    pub fn add_fulltext(
-        &self,
-        path: &str,
-        title: &str,
-        content: &str,
-        keywords: &str,
-        word_count: u32,
-        geo: Option<(f64, f64)>,
-        lang_override: &str,
-    ) -> Result<()> {
-        self.add_doc(&self.prepare_fulltext(
-            path,
-            title,
-            content.as_bytes(),
-            keywords.as_bytes(),
-            word_count,
-            geo,
-            lang_override,
-        )?)
+    pub fn add_fulltext(&self, input: FulltextDocument<'_>) -> Result<()> {
+        self.add_doc(&self.prepare_fulltext(input)?)
     }
 
-    pub fn finalize(mut self) -> Result<()> {
+    /// Publishes a complete database, failing if another writer created the
+    /// output meanwhile. Requires a filesystem supporting same-volume hard links.
+    pub fn finalize(self) -> Result<()> {
         let rc = unsafe { ffi::xb_finalize(self.raw) };
-        self.finalized = true;
         if rc != 0 {
             return Err(anyhow!("xb_finalize: {}", last_error()));
         }
+        // Linking a private, complete file is atomic and cannot replace an
+        // existing destination, including a dangling symlink. Both paths are
+        // on the same filesystem. Drop removes only our private link/workspace.
+        std::fs::hard_link(self.workspace.path().join("compacted"), &self.final_path)
+            .with_context(|| {
+                format!(
+                    "publishing index without overwrite: {}",
+                    self.final_path.display()
+                )
+            })?;
         Ok(())
     }
 }
@@ -279,12 +298,8 @@ impl Drop for Builder {
             unsafe { ffi::xb_builder_free(self.raw) };
             self.raw = std::ptr::null_mut();
         }
-        // Always clean up the temp directory; libzim does the same in
-        // its indexer destructor. Errors here are best-effort — the
-        // caller may already be unwinding from a different failure.
-        if self.tmp_path.exists() {
-            let _ = std::fs::remove_dir_all(&self.tmp_path);
-        }
+        // TempDir removes only the workspace exclusively created by this builder,
+        // after the native database has closed. Never remove a caller-owned path.
     }
 }
 
@@ -300,8 +315,8 @@ fn last_error() -> String {
 }
 
 fn path_to_cstring(p: &Path) -> Result<CString> {
-    let s = p.to_str().with_context(|| {
-        format!("path is not valid UTF-8: {}", p.display())
-    })?;
+    let s = p
+        .to_str()
+        .with_context(|| format!("path is not valid UTF-8: {}", p.display()))?;
     Ok(CString::new(s)?)
 }
