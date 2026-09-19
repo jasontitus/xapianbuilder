@@ -1,8 +1,30 @@
-// xapianbuilder C ABI exposed to Rust.
-//
-// The whole GPL-derived pipeline (HTML parsing borrowed from omega via
-// libzim, accent removal via ICU, term emission via xapian-core) lives
-// behind this boundary.
+/*
+ * xapianbuilder C ABI exposed to Rust.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This is a local interface, not a copied libzim header. It exposes the
+ * implementation adapted from libzim's writer/tools code in bridge.cc;
+ * that file and UPSTREAM.md identify the upstream authors and licenses.
+ * The HTML parser's original notices remain in the separate parser files.
+ *
+ * Local interface created 2026-04-27; subsequently extended for configurable
+ * normalization/stemming and parallel document preparation. Last API changes
+ * 2026-09-18: length-bearing parsed keyword output.
+ * Notices added 2026-09-19.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, see <https://www.gnu.org/licenses/>.
+ */
 
 #pragma once
 

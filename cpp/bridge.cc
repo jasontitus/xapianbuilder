@@ -1,9 +1,54 @@
-// xapianbuilder C++/Xapian/ICU implementation.
-//
-// Mirrors libzim's xapianIndexer.cpp + xapianWorker.cpp + tools.cpp
-// pipeline so the resulting glass DBs are byte-compatible with kiwix
-// readers. See UPSTREAM.md for provenance and the reference checkout:
-// https://github.com/openzim/libzim/tree/dde6c500a7557457ec7117295cfc54442fccb76e/src/writer
+/*
+ * xapianbuilder C++/Xapian/ICU implementation.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This is a local adaptation, not a verbatim libzim translation unit.
+ * The following notices apply to the upstream portions adapted here:
+ *
+ * src/writer/xapianIndexer.cpp (GPL-3.0-or-later):
+ * Copyright (C) 2021 Maneesh P M
+ * Copyright (C) 2018-2021 Matthieu Gautier
+ * Copyright (C) 2011 Emmanuel Engelhart
+ *
+ * src/writer/xapianWorker.cpp (GPL-2.0-or-later):
+ * Copyright (C) 2021 Maneesh P M
+ * Copyright (C) 2020-2021 Matthieu Gautier
+ *
+ * src/writer/defaultIndexData.h (GPL-2.0-or-later):
+ * Copyright (C) 2021 Matthieu Gautier
+ *
+ * src/tools.cpp (GPL-3.0-or-later; name spelling retained from upstream):
+ * Copyright (C) 2016-2021 Matthieu Gautier
+ * Copyright (C) 2021 Maneeshs P M
+ * Copyright (C) 2013-2016 Emmanuel Engelhart
+ *
+ * src/constants.h (GPL-2.0-or-later):
+ * Copyright (C) 2021 Maneesh P M
+ *
+ * Reference baseline (not a recorded original-import revision):
+ * https://github.com/openzim/libzim/tree/dde6c500a7557457ec7117295cfc54442fccb76e
+ * See UPSTREAM.md for provenance and differences from that baseline.
+ *
+ * Local adaptation created 2026-04-27: C ABI, Xapian indexing and ICU
+ * normalization outside libzim. Subsequent changes include configurable
+ * normalization/stemming and parallel document preparation. Implementation
+ * last modified 2026-09-18: boundary/error handling, ownership, and Unicode
+ * normalization hardening. Notices added 2026-09-19.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version. This does not remove the original
+ * GPL-2.0-or-later grants for the upstream portions identified above.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, see <https://www.gnu.org/licenses/>.
+ */
 
 #include "bridge.h"
 

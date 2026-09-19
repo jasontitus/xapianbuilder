@@ -19,6 +19,15 @@
  * USA
  */
 
+/*
+ * Local modifications for xapianbuilder (upstream notice retained above):
+ * 2026-04-27: imported from libzim; removed libzim/config includes and the
+ * LIBZIM_PRIVATE_API annotation for the standalone build.
+ * 2026-09-18: added script/style raw-text state and a transparent entity-map
+ * comparator for allocation-free lookup.
+ * 2026-09-19: added this modification notice. See UPSTREAM.md for provenance.
+ */
+
 #ifndef OMEGA_INCLUDED_HTMLPARSE_H
 #define OMEGA_INCLUDED_HTMLPARSE_H
 

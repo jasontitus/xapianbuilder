@@ -19,6 +19,14 @@
  * USA
  */
 
+/*
+ * Local modifications for xapianbuilder (upstream notice retained above):
+ * 2026-04-27: imported from libzim; removed the libzim include and
+ * LIBZIM_PRIVATE_API annotation for the standalone build.
+ * 2026-09-18: changed latitude/longitude storage from float to double.
+ * 2026-09-19: added this modification notice. See UPSTREAM.md for provenance.
+ */
+
 #ifndef OMEGA_INCLUDED_MYHTMLPARSE_H
 #define OMEGA_INCLUDED_MYHTMLPARSE_H
 

@@ -1,4 +1,5 @@
-//! Stopword lists vendored from libzim's `static/stopwords/<lang>`.
+//! MIT-licensed Stopwords ISO lists, vendored via libzim's `static/stopwords/<lang>`.
+//! See UPSTREAM.md and LICENSES/Stopwords-ISO{,-gu}-MIT.txt for attribution.
 //!
 //! libzim's indexer looks up stopwords by exact filename match against
 //! whatever language string the caller passed in. The shipped files

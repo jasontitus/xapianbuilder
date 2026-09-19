@@ -19,6 +19,15 @@
  * USA
  */
 
+/*
+ * Local modifications for xapianbuilder (upstream notice retained above):
+ * Imported from libzim on 2026-04-27.
+ * 2026-09-18: replaced unchecked geo parsing with classic-locale, complete-
+ * consumption, finite-value and coordinate-range checks; publish coordinates
+ * only when both are valid.
+ * 2026-09-19: added this modification notice. See UPSTREAM.md for provenance.
+ */
+
 // #include <config.h>
 
 #include "myhtmlparse.h"

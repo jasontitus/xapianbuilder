@@ -20,6 +20,15 @@
  * USA
  */
 
+/*
+ * Local modifications for xapianbuilder (upstream notice retained above):
+ * Imported from libzim on 2026-04-27.
+ * 2026-09-18: added bounds checks for truncated tags/attributes, linear
+ * entity decoding with overflow/Unicode-scalar checks and allocation-free
+ * lookup, and matching-end-tag handling for script/style raw text.
+ * 2026-09-19: added this modification notice. See UPSTREAM.md for provenance.
+ */
+
 // #include <config.h>
 
 #include "htmlparse.h"
